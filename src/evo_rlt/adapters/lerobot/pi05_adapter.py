@@ -13,6 +13,7 @@ from lerobot.policies.pi05.modeling_pi05 import (
     pad_vector,
     resize_with_pad_torch,
 )
+from evo_rlt.adapters.lerobot.fast_init import install_pi05_fast_load
 from evo_rlt.core.interfaces import Observation, VLAOutput
 from evo_rlt.core.utils import postprocess_prefix_tokens
 from evo_rlt.core.vla_adapter import VLAAdapter
@@ -88,6 +89,7 @@ class Pi05VLAAdapter(VLAAdapter):
         self.pi05_config = pi05_config
         self.num_inference_steps = pi05_config.num_inference_steps
 
+        install_pi05_fast_load()
         policy = PI05Policy.from_pretrained(
             model_path,
             config=pi05_config,

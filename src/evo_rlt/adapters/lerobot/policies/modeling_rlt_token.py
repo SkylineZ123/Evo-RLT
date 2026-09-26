@@ -17,6 +17,7 @@ from typing_extensions import Unpack
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.policies.pretrained import ActionSelectKwargs, PreTrainedPolicy
+from evo_rlt.adapters.lerobot.fast_init import install_pi05_fast_load
 from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPolicyConfig
 from lerobot.policies.utils import log_model_loading_keys
 from evo_rlt.core.rl_token import RLTokenModule
@@ -125,6 +126,7 @@ class RLTokenPolicy(PreTrainedPolicy):
         pi05_cfg = _load_pi05_config_from_dir(self.config.vla_pretrained_path)
         pi05_cfg.dtype = self.config.vla_dtype
         pi05_cfg.device = self.config.device
+        install_pi05_fast_load()
         pi05 = PI05Policy.from_pretrained(
             self.config.vla_pretrained_path,
             config=pi05_cfg,

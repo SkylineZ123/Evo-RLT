@@ -39,6 +39,7 @@ evo-rlt-prepare-mix-buckets = "evo_rlt.cli.prepare_mix_buckets:main"
 evo-rlt-rescale-cache-reward = "evo_rlt.cli.rescale_cache_reward:main"
 evo-rlt-train-actor-critic = "evo_rlt.cli.train_chunk_actor_critic:main"
 evo-rlt-train-rl-token = "evo_rlt.cli.train_rl_token:main"
+evo-rlt-train-pi05-sft = "evo_rlt.cli.train_pi05_sft:main"
 evo-rlt-collect-default = "evo_rlt.adapters.lerobot.record.cli:collect_default_main"
 evo-rlt-record = "evo_rlt.adapters.lerobot.record.cli:main"
 

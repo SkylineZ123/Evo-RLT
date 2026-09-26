@@ -1,0 +1,63 @@
+# Piper 采血管插入任务的 pi0.5 SFT（基于 LeRobot 官方 lerobot_train，封装了 wandb / resume / 多卡）
+#
+#   evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml
+#   evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --num-gpus 2     # 双卡 DDP
+#   evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --resume         # 续训 output_dir
+#   evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --resume --steps 50000   # 续训并加步数
+#   evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --dry-run        # 只打印 lerobot 命令
+#
+# 键名与命令行参数一一对应（batch_size == --batch-size），命令行优先；写 null 表示沿用内置默认值。
+# 未识别的参数原样转发给 lerobot_train，例如 --policy.optimizer_betas='[0.9,0.95]'。
+# resume 时以 checkpoint 里的 train_config.json 为准，只重新应用 steps/save_freq/log_freq/num_workers；
+# wandb 会接回同一个 run。
+
+# ---- 数据 ----
+dataset_root: /home/vipuser/data_300g/data_lerobot3/piper/0925_blood_gas_insertion_20260925/teleop_154125
+dataset_repo_id: local/blood_gas_insertion_teleop_154125
+episodes: null            # 例如 [0, 1, 2] 只用部分 episode
+rename_map:               # 数据集相机 -> pi05_base 的相机槽位
+  observation.images.front: observation.images.base_0_rgb
+  observation.images.wrist: observation.images.right_wrist_0_rgb
+video_backend: pyav
+image_transforms: true   # true 打开 LeRobot 默认的颜色/仿射增强
+
+# ---- 模型 ----
+policy_path: lerobot/pi05_base
+dtype: bfloat16
+gradient_checkpointing: true
+freeze_vision_encoder: false
+train_expert_only: false  # true 时只训 action expert，省显存
+chunk_size: 30
+n_action_steps: 30
+compile_model: true       # torch.compile 前向；前几步要编译（几分钟），之后每步更快
+compile_mode: null        # null = pi05 预设 max-autotune
+drop_unused_cameras: true # 删掉没有数据集相机映射的槽位（left_wrist_0_rgb），否则它会被喂空图、白跑一遍 SigLIP 并多占 256 个前缀 token
+
+# ---- 训练 ----
+output_dir: /home/vipuser/data_200g/zzq/weights/pi05_sft/blood_gas_teleop_0925
+job_name: pi05_sft_blood_gas
+steps: 30000
+batch_size: 8             # 每卡 batch；多卡时有效 batch = batch_size x num_gpus
+num_workers: 4
+save_freq: 5000
+log_freq: 100
+seed: 1000
+lr: null                  # null = pi05 预设 2.5e-5
+warmup_steps: null        # null = pi05 预设 1000
+decay_steps: null         # null = steps
+decay_lr: null            # null = pi05 预设 2.5e-6
+
+# ---- wandb ----
+wandb: true
+wandb_project: evo_rlt_pi05_sft
+wandb_entity: null
+wandb_mode: null          # online / offline / disabled；null = online
+wandb_notes: null
+wandb_disable_artifact: true   # 不把每个 ~7GB checkpoint 上传为 artifact
+
+# ---- 运行 ----
+num_gpus: 1
+gpu_ids: null             # 例如 "0,1"
+mixed_precision: "no"     # 模型本身已是 bf16
+hf_offline: true          # 只用本地 HF 缓存（pi05_base / paligemma tokenizer），避免 Hub 429；首次下载时改为 false
+resume: null              # true = 续训 output_dir；也可填某个 run 目录

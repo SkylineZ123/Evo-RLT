@@ -200,7 +200,22 @@ For saved checkpoints, LeRobot `0.5.1` writes numeric checkpoint directories suc
 
 ### 3) Finetune VLA
 
-Use LeRobot's training entrypoint to finetune a pi0.5 VLA checkpoint on a LeRobot dataset.
+`evo-rlt-train-pi05-sft` wraps LeRobot's `lerobot_train` (same loss, optimizer preset, checkpoints) with a YAML config, wandb, resume and multi-GPU launch. Keys in the YAML are the CLI option names; CLI flags override the file, and unknown flags are forwarded to `lerobot_train`.
+
+```bash
+# new run (edit dataset_root / rename_map / output_dir in the YAML first)
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml
+# two GPUs (DDP via accelerate launch; effective batch = batch_size x num_gpus)
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --num-gpus 2
+# resume output_dir from checkpoints/last (optionally extend --steps); wandb continues the same run
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --resume --steps 50000
+# print the underlying lerobot_train command without running it
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --dry-run
+```
+
+`rename_map` maps the dataset cameras onto pi05_base's camera slots (`base_0_rgb`, `left_wrist_0_rgb`, `right_wrist_0_rgb`); unused slots are filled with empty images, which still cost a SigLIP pass and 256 masked prefix tokens each — `drop_unused_cameras: true` removes those slots from the policy config instead (saved with the checkpoints, so deployment uses the same cameras). `compile_model: true` enables `torch.compile` on the policy forward. Set `wandb: false` or `--wandb-mode offline` if wandb is not logged in.
+
+The equivalent raw LeRobot command:
 
 ```bash
 python -m lerobot.scripts.lerobot_train \
