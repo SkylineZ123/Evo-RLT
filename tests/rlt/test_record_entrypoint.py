@@ -75,6 +75,7 @@ def test_segment_rlt_argv_marks_key_segment_with_teleop_start_and_rtc():
     paths = SimpleNamespace(
         dataset_name="local/test",
         dataset_root="/tmp/dataset",
+        resume=False,
     )
     argv = build_segment_record_argv(
         args=args,
@@ -269,7 +270,7 @@ def test_default_collect_argv_matches_best_real_robot_rtc_chunks():
         },
         right_cameras={"wrist": {}, "front": {}},
     )
-    paths = SimpleNamespace(dataset_name="local/eval_vla_rlt_vla_123456", dataset_root="/tmp/dataset")
+    paths = SimpleNamespace(dataset_name="local/eval_vla_rlt_vla_123456", dataset_root="/tmp/dataset", resume=False)
 
     argv = build_default_collect_record_argv(
         args=args,
@@ -326,7 +327,7 @@ def test_default_collect_only_critical_starts_recording_on_first_r_and_ends_on_s
         left_cameras={},
         right_cameras={},
     )
-    paths = SimpleNamespace(dataset_name="local/eval_vla_rlt_vla_123456", dataset_root="/tmp/dataset")
+    paths = SimpleNamespace(dataset_name="local/eval_vla_rlt_vla_123456", dataset_root="/tmp/dataset", resume=False)
 
     argv = build_default_collect_record_argv(
         args=args,
@@ -374,7 +375,7 @@ def test_default_collect_start_with_teleop_sets_episode_initial_source():
         left_cameras={},
         right_cameras={},
     )
-    paths = SimpleNamespace(dataset_name="local/eval_vla_rlt_vla_123456", dataset_root="/tmp/dataset")
+    paths = SimpleNamespace(dataset_name="local/eval_vla_rlt_vla_123456", dataset_root="/tmp/dataset", resume=False)
 
     argv = build_default_collect_record_argv(
         args=args,
@@ -575,7 +576,7 @@ def test_default_collect_argv_accepts_headless_default_episode_success():
         only_critical=False,
     )
     setup = SimpleNamespace(followers=[{"port": "left"}, {"port": "right"}], left_cameras={}, right_cameras={})
-    paths = SimpleNamespace(dataset_name="local/test", dataset_root="/tmp/dataset")
+    paths = SimpleNamespace(dataset_name="local/test", dataset_root="/tmp/dataset", resume=False)
 
     argv = build_default_collect_record_argv(args, setup, paths, "/tmp/cal", ["--teleop.type=bi_so_leader"])
 

@@ -25,6 +25,9 @@ def register() -> None:
     from evo_rlt.adapters.lerobot.policies.configuration_rlt_ac import ChunkACPolicyConfig
     from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPolicyConfig
 
+    # Registers --robot.type=piper / --teleop.type=piper_leader; pyAgxArm loads on connect().
+    import evo_rlt.adapters.lerobot.hardware.piper  # noqa: F401
+
     PreTrainedConfig._choice_registry["rlt"] = RLTPretrainedConfig
     PreTrainedConfig._choice_registry["rlt_ac"] = ChunkACPolicyConfig
     PreTrainedConfig._choice_registry["rlt_token"] = RLTokenPolicyConfig

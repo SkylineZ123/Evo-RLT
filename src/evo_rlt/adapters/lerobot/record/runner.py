@@ -14,17 +14,20 @@ from evo_rlt.adapters.lerobot import register
 from evo_rlt.adapters.lerobot.record.common import (
     build_dataset_argv,
     build_policy_overrides,
-    build_robot_argv,
     build_rtc_argv,
+    build_setup_robot_argv,
     build_teleop_argv,
     configure_logging,
+    is_piper_setup,
     load_robot_setup,
     preflight_motor_connections,
+    preflight_piper_connections,
+    print_dataset_target,
     remove_existing_dataset,
-    resolve_run_paths,
+    resolve_record_paths,
     set_offline_env,
-    stage_follower_calibrations,
     stage_leader_calibrations,
+    stage_setup_follower_calibrations,
 )
 
 log = logging.getLogger(__name__)
@@ -38,13 +41,15 @@ def prepare_lerobot_runtime(
     skip_policyless_reset_loop: bool = False,
     background_episode_video_encoding: bool = False,
 ) -> None:
-    if double_tap_episode_outcome_key is not None:
-        if double_tap_episode_outcome_window_s is None:
-            raise ValueError("double_tap_episode_outcome_window_s is required")
-        _patch_double_tap_episode_outcome_listener(
-            double_tap_episode_outcome_window_s,
-            double_tap_episode_outcome_key,
-        )
+    if double_tap_episode_outcome_key is not None and double_tap_episode_outcome_window_s is None:
+        raise ValueError("double_tap_episode_outcome_window_s is required")
+    # Always installed: LeRobot 0.5.1's `init_keyboard_listener()` takes no arguments, while
+    # `backend.record` passes the HIL/RLT key bindings as keyword arguments. Must run before
+    # `backend` is first imported, since it binds the function at import time.
+    _patch_double_tap_episode_outcome_listener(
+        double_tap_episode_outcome_window_s or 0.0,
+        double_tap_episode_outcome_key,
+    )
     register()
     if intervention_toggle_key is not None:
         _patch_record_intervention_toggle_key(intervention_toggle_key)
@@ -141,6 +146,17 @@ class _DoubleTapEpisodeOutcomeRouter:
 
 
 PEDAL_TOGGLE_COOLDOWN_S = 0.5
+# Pseudo event names for plain success/failure keys: they set `episode_outcome` and end the episode.
+_EPISODE_OUTCOME_EVENT_PREFIX = "episode_outcome:"
+
+
+def _fire_record_event(events: dict[str, Any], event_name: str) -> None:
+    if event_name.startswith(_EPISODE_OUTCOME_EVENT_PREFIX):
+        events["episode_outcome"] = event_name.removeprefix(_EPISODE_OUTCOME_EVENT_PREFIX)
+        events["exit_early"] = True
+        logging.info("Episode outcome marked as %s", events["episode_outcome"])
+        return
+    events[event_name] = True
 
 
 def _start_record_event_pedal_listener(
@@ -177,8 +193,8 @@ def _start_record_event_pedal_listener(
             if now - last_event_times.get(event_name, 0.0) < PEDAL_TOGGLE_COOLDOWN_S:
                 return
             last_event_times[event_name] = now
-        logging.info("Pedal '%s' pressed -> events[%s] = True", normalized_key, event_name)
-        events[event_name] = True
+        logging.info("Pedal '%s' pressed -> %s", normalized_key, event_name)
+        _fire_record_event(events, event_name)
 
     listener = PedalListener(on_press=on_press)
     if listener.start():
@@ -225,7 +241,7 @@ def _start_record_event_keyboard_listener(events: dict[str, Any], key_bindings: 
         key_name = _pynput_key_name(key, keyboard)
         event_name = event_by_key.get(key_name)
         if event_name is not None:
-            events[event_name] = True
+            _fire_record_event(events, event_name)
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
@@ -248,8 +264,14 @@ def _ensure_record_events(events: dict[str, Any]) -> None:
 
 def _patch_double_tap_episode_outcome_listener(
     double_tap_window_s: float,
-    outcome_key: str,
+    outcome_key: str | None,
 ) -> None:
+    """Make `init_keyboard_listener` accept the record key bindings as keyword arguments.
+
+    With ``outcome_key`` the episode outcome comes from a single/double tap of that key (and
+    the pedal). Without it, ``episode_success_key`` / ``episode_failure_key`` label and end
+    the episode directly, unless another control already owns the key.
+    """
     import lerobot.utils.control_utils as control_utils
 
     if getattr(control_utils.init_keyboard_listener, "_evo_rlt_double_tap_episode_outcome", False):
@@ -260,8 +282,8 @@ def _patch_double_tap_episode_outcome_listener(
     def init_keyboard_listener(*args, **kwargs):
         intervention_toggle_key = kwargs.pop("intervention_toggle_key", None)
         critical_phase_toggle_key = kwargs.pop("critical_phase_toggle_key", None)
-        kwargs.pop("episode_success_key", None)
-        kwargs.pop("episode_failure_key", None)
+        episode_success_key = kwargs.pop("episode_success_key", None)
+        episode_failure_key = kwargs.pop("episode_failure_key", None)
         cp_success_key = kwargs.pop("cp_success_key", None)
         cp_failure_key = kwargs.pop("cp_failure_key", None)
         rl_phase_key = kwargs.pop("rl_phase_key", None)
@@ -269,7 +291,11 @@ def _patch_double_tap_episode_outcome_listener(
         end_failure_key = kwargs.pop("end_failure_key", None)
         keyboard_listener, events = original_init_keyboard_listener()
         _ensure_record_events(events)
-        router = _DoubleTapEpisodeOutcomeRouter(events, outcome_key, double_tap_window_s)
+        router = (
+            _DoubleTapEpisodeOutcomeRouter(events, outcome_key, double_tap_window_s)
+            if outcome_key is not None
+            else None
+        )
         record_key_bindings = {
             intervention_toggle_key: "toggle_intervention",
             critical_phase_toggle_key: "toggle_critical_phase",
@@ -279,8 +305,17 @@ def _patch_double_tap_episode_outcome_listener(
             end_success_key: "end_phase_success",
             end_failure_key: "end_phase_failure",
         }
+        if router is None:
+            bound_keys = {
+                _event_key_name(key) for key, event in record_key_bindings.items() if event is not None
+            }
+            for key, outcome in ((episode_success_key, "success"), (episode_failure_key, "failure")):
+                if _event_key_name(key) is not None and _event_key_name(key) not in bound_keys:
+                    record_key_bindings[key] = f"{_EPISODE_OUTCOME_EVENT_PREFIX}{outcome}"
         pedal_listener = _start_record_event_pedal_listener(events, record_key_bindings, router)
-        extra_keyboard_listener = _start_double_tap_keyboard_listener(outcome_key, router)
+        extra_keyboard_listener = (
+            _start_double_tap_keyboard_listener(outcome_key, router) if router is not None else None
+        )
         record_event_listener = _start_record_event_keyboard_listener(events, record_key_bindings)
         return (
             _CompositeListener(keyboard_listener, pedal_listener, extra_keyboard_listener, record_event_listener, router),
@@ -473,10 +508,11 @@ def run_collect(args: argparse.Namespace) -> None:
         validation_keys["episode_outcome_key"] = episode_outcome_key
     _validate_distinct_keys(**validation_keys)
     setup = load_robot_setup(args.setup_json)
-    paths = resolve_run_paths(setup.setup, args.dataset_tag, "eval_vla_rlt_vla")
+    paths = resolve_record_paths(setup.setup, args.dataset_tag, "eval_vla_rlt_vla", args.resume)
     configure_logging(paths.log_file, args.log_level)
-    remove_existing_dataset(paths.dataset_root)
-    teleop_argv = build_teleop_argv(setup.leaders, args.no_teleop)
+    if not paths.resume:
+        remove_existing_dataset(paths.dataset_root)
+    teleop_argv = build_teleop_argv(setup.leaders, args.no_teleop, setup.robot_type)
 
     if args.policy_path is None:
         raise ValueError("default collection requires --policy-path")
@@ -485,7 +521,7 @@ def run_collect(args: argparse.Namespace) -> None:
 
     leader_cal_dir = None
     with TemporaryDirectory(prefix="record-collect-") as cal_dir:
-        stage_follower_calibrations(setup.followers, cal_dir)
+        stage_setup_follower_calibrations(setup, cal_dir)
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
         sys.argv = build_default_collect_record_argv(args, setup, paths, cal_dir, teleop_argv)
         print_collect_summary(args, paths)
@@ -520,7 +556,7 @@ def build_default_collect_record_argv(
 ) -> list[str]:
     argv = [
         "record_collect",
-        *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+        *build_setup_robot_argv(setup, cal_dir),
         *teleop_argv,
         *build_policy_overrides(
             policy_path=args.policy_path,
@@ -536,6 +572,7 @@ def build_default_collect_record_argv(
             episode_time_s=args.episode_time_s,
             fps=args.fps,
             vcodec=args.vcodec,
+            resume=paths.resume,
         ),
         *_collect_rlt_phase_argv(args),
         *build_rtc_argv(
@@ -561,7 +598,7 @@ def build_default_collect_record_argv(
 def print_collect_summary(args: argparse.Namespace, paths) -> None:
     vla_horizon = args.vla_rtc_execution_horizon or args.rtc_execution_horizon
     print("\nDefault VLA-RLT-VLA collection")
-    print(f"Dataset: {paths.dataset_name} -> {paths.dataset_root}")
+    print_dataset_target(paths, args.task)
     print(f"Log: {paths.log_file}")
     print(f"Policy: {args.policy_path}")
     print(f"VLA: {args.vla_path}")
@@ -601,24 +638,32 @@ def print_collect_summary(args: argparse.Namespace, paths) -> None:
 def run_segment(args: argparse.Namespace) -> None:
     set_offline_env()
     setup = load_robot_setup(args.setup_json)
-    paths = resolve_run_paths(setup.setup, args.dataset_tag, f"eval_{args.critical_source}_segment")
+    paths = resolve_record_paths(
+        setup.setup, args.dataset_tag, f"eval_{args.critical_source}_segment", args.resume
+    )
     configure_logging(paths.log_file, args.log_level)
-    remove_existing_dataset(paths.dataset_root)
+    if not paths.resume:
+        remove_existing_dataset(paths.dataset_root)
 
     if args.critical_source in {"rlt", "vla"} and args.policy_path is None:
         raise ValueError("segment recording with critical-source rlt/vla requires --policy-path")
     if args.rtc and not args.vla_ref and args.critical_source == "rlt":
         raise ValueError("RTC RLT recording requires --vla-ref; --no-vla-ref hides the guided reference")
 
-    teleop_argv = build_teleop_argv(setup.leaders, args.no_teleop)
+    teleop_argv = build_teleop_argv(setup.leaders, args.no_teleop, setup.robot_type)
     if args.initial_source == "teleop" and not teleop_argv:
         raise ValueError("--initial-source teleop requires leader teleop arms")
 
     leader_cal_dir = None
     with TemporaryDirectory(prefix="record-segment-") as cal_dir:
-        stage_follower_calibrations(setup.followers, cal_dir)
+        stage_setup_follower_calibrations(setup, cal_dir)
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
-        if not args.dry_run and args.preflight:
+        if not args.dry_run and args.preflight and is_piper_setup(setup):
+            preflight_piper_connections(
+                setup.followers[0],
+                setup.leaders[0] if teleop_argv else None,
+            )
+        elif not args.dry_run and args.preflight:
             preflight_motor_connections(
                 setup.followers,
                 setup.leaders if teleop_argv else [],
@@ -645,7 +690,7 @@ def run_segment(args: argparse.Namespace) -> None:
 def build_segment_record_argv(args, setup, paths, cal_dir: str, teleop_argv: list[str]) -> list[str]:
     argv = [
         "record_segment",
-        *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+        *build_setup_robot_argv(setup, cal_dir),
         *teleop_argv,
         *build_segment_policy_argv(args),
         *build_dataset_argv(
@@ -656,6 +701,7 @@ def build_segment_record_argv(args, setup, paths, cal_dir: str, teleop_argv: lis
             episode_time_s=args.episode_time_s,
             fps=args.fps,
             vcodec=args.vcodec,
+            resume=paths.resume,
         ),
         *build_reset_time_argv(args),
         "--rlt.enable=true",
@@ -708,7 +754,8 @@ def build_reset_time_argv(args: argparse.Namespace) -> list[str]:
 
 def print_segment_summary(args: argparse.Namespace, paths) -> None:
     vla_horizon = args.vla_rtc_execution_horizon or args.rtc_execution_horizon
-    print(f"\nDataset: {paths.dataset_name} -> {paths.dataset_root}")
+    print()
+    print_dataset_target(paths, args.task)
     print(f"Log: {paths.log_file}")
     print(f"Initial source: {args.initial_source}")
     print(f"Critical source: {args.critical_source}")
@@ -732,23 +779,27 @@ def print_segment_summary(args: argparse.Namespace, paths) -> None:
 def run_full(args: argparse.Namespace) -> None:
     set_offline_env()
     setup = load_robot_setup(args.setup_json)
-    paths = resolve_run_paths(setup.setup, args.dataset_tag, f"eval_{args.initial_source}_full")
+    paths = resolve_record_paths(
+        setup.setup, args.dataset_tag, f"eval_{args.initial_source}_full", args.resume
+    )
     configure_logging(paths.log_file, args.log_level)
-    remove_existing_dataset(paths.dataset_root)
-    teleop_argv = build_teleop_argv(setup.leaders, args.no_teleop)
+    if not paths.resume:
+        remove_existing_dataset(paths.dataset_root)
+    teleop_argv = build_teleop_argv(setup.leaders, args.no_teleop, setup.robot_type)
 
     if args.initial_source == "vla" and args.policy_path is None:
         raise ValueError("full recording with --initial-source vla requires --policy-path")
     if args.initial_source == "teleop" and not teleop_argv:
         raise ValueError("full recording with --initial-source teleop requires leader teleop arms")
+    print_dataset_target(paths, args.task)
 
     leader_cal_dir = None
     with TemporaryDirectory(prefix="record-full-") as cal_dir:
-        stage_follower_calibrations(setup.followers, cal_dir)
+        stage_setup_follower_calibrations(setup, cal_dir)
         leader_cal_dir = stage_leader_calibrations(setup.leaders, teleop_argv)
         sys.argv = [
             "record_full",
-            *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+            *build_setup_robot_argv(setup, cal_dir),
             *teleop_argv,
             *build_policy_overrides(
                 policy_path=args.policy_path,
@@ -765,6 +816,7 @@ def run_full(args: argparse.Namespace) -> None:
                 episode_time_s=args.episode_time_s,
                 fps=args.fps,
                 vcodec=args.vcodec,
+                resume=paths.resume,
             ),
             *build_reset_time_argv(args),
             *build_rtc_argv(
@@ -808,7 +860,7 @@ def run_live(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"RTC eval script not found: {eval_script}")
 
     with TemporaryDirectory(prefix="record-live-cal-") as cal_dir:
-        stage_follower_calibrations(setup.followers, cal_dir)
+        stage_setup_follower_calibrations(setup, cal_dir)
         sys.argv = [
             "eval_with_real_robot",
             *build_policy_overrides(
@@ -824,7 +876,7 @@ def run_live(args: argparse.Namespace) -> None:
             f"--rtc.execution_horizon={args.rtc_execution_horizon}",
             f"--rtc.max_guidance_weight={args.rtc_max_guidance_weight}",
             f"--rtc.prefix_attention_schedule={args.rtc_prefix_attention_schedule}",
-            *build_robot_argv(setup.followers, setup.left_cameras, setup.right_cameras, cal_dir),
+            *build_setup_robot_argv(setup, cal_dir),
             f"--task={args.task}",
             f"--duration={args.duration}",
             f"--fps={args.fps}",

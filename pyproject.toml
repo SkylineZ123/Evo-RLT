@@ -23,6 +23,10 @@ lerobot = [
     "evdev>=1.7",
     "feetech-servo-sdk>=1.0.0",
 ]
+piper = [
+    "pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git",
+    "pyrealsense2>=2.55",
+]
 test = ["pytest>=8.1", "pytest-timeout>=2.4"]
 dev = ["evo-rlt[lerobot,test]", "ruff>=0.6"]
 

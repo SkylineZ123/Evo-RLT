@@ -1,0 +1,45 @@
+# Piper 只录关键段（比 collect 更底层，可指定关键段由 RLT 还是 VLA 执行）
+#
+#   evo-rlt-record --config configs/record/piper_segment.yaml
+#
+# 按键：r 开始录关键段；再按 r 结束并标 success，r+r（双击）标 failure
+#       space 人工接管 / 交还（接管期间用主臂示教按钮拖动）
+# 典型用途：critical_source: vla 录 VLA 在关键段的基线表现，与 rlt 对比。
+
+command: segment
+
+setup_json: configs/record/piper_setup.json
+task: "Pick up the peg and insert it into the hole."   # ← 与 SFT / cache 构建时一致
+
+initial_source: vla        # 关键段之前由谁控制：vla / teleop
+critical_source: rlt       # 关键段由谁执行：rlt（actor）/ vla
+
+policy_path: outputs/ac/checkpoints/last/pretrained_model
+vla_path: outputs/vla_ft/checkpoints/last/pretrained_model
+rl_token_path: outputs/rl_token/checkpoints/last/pretrained_model
+
+num_episodes: 10
+episode_time_s: 3000
+reset_time_s: null         # episode 之间的复位时长（秒）；null 用内置默认值
+fps: 30
+dataset_tag: piper_segment
+resume: null               # 接着已有数据集采集：true = 本 dataset_tag 下最近一次有数据的数据集；也可填数据集目录；null = 新建
+vcodec: h264
+
+chunk_exec_steps: 25                   # critical_source: vla 时每个 VLA 动作块执行的步数
+double_tap_window_s: 0.6
+intervention_action_blend_time_s: 0.4  # 人工接管时从策略动作平滑过渡到主臂动作的时长（秒）
+vla_ref: true
+preflight: true            # 加载策略前先检查 CAN 通信（被动检查，不会使能机械臂）
+no_teleop: false
+default_episode_success: null
+
+rtc: true
+rtc_execution_horizon: 10
+vla_rtc_execution_horizon: null
+rtc_max_guidance_weight: 10.0
+rtc_prefix_attention_schedule: EXP
+rtc_action_queue_size_to_get_new_actions: null
+
+log_level: INFO
+dry_run: false

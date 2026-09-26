@@ -1,0 +1,49 @@
+# Piper VLA → RLT → VLA rollout 采集 + 人工介入（RLT 迭代的主采集方式）
+#
+#   evo-rlt-record --config configs/record/piper_collect_hil.yaml
+#
+# only_critical: true 时的按键：
+#   r            进入 RLT actor 并开始录关键段；再按 r 保存为 success，r+r（双击）保存为 failure
+#   space        人工接管；接管后按主臂示教按钮拖动，再按示教按钮退出，最后按 space 交还策略
+#                （示教按钮未松开时 space 交还会被拒绝）
+#   ←            重录当前 episode      Esc  结束采集
+# only_critical: false 时录整条轨迹，r 只用于标记整条 episode 的成功/失败。
+# 录下的 episode_success 和 complementary_info.is_intervention 供 rl_rollout bucket 使用。
+
+command: collect
+
+setup_json: configs/record/piper_setup.json
+task: "Pick up the peg and insert it into the hole."   # ← 与 SFT / cache 构建时一致
+
+# 模型路径（相对于运行命令时的当前目录；没有 checkpoints/last 时改用最大编号目录）
+policy_path: outputs/ac/checkpoints/last/pretrained_model          # rlt_ac actor-critic
+vla_path: outputs/vla_ft/checkpoints/last/pretrained_model         # SFT 后的 pi0.5
+rl_token_path: outputs/rl_token/checkpoints/last/pretrained_model  # RL token
+
+num_episodes: 10
+episode_time_s: 3000       # 单条 episode 的时长上限（秒），实际由按键结束
+fps: 30
+dataset_tag: piper_rollout
+resume: null               # 接着已有数据集采集：true = 本 dataset_tag 下最近一次有数据的数据集；也可填数据集目录；null = 新建
+vcodec: h264
+
+only_critical: true        # 只录关键段（推荐：actor/critic 只在关键段上训练）
+start_with_teleop: false   # true：每条 episode 从人工遥操作开始，而不是 VLA
+rlt_toggle_key: r
+teleop_toggle_key: space
+double_tap_window_s: 0.6   # 双击判定为 failure 的时间窗（秒）
+default_episode_success: null   # 无人值守时可设 success / failure 作为默认标签
+no_teleop: false           # 必须为 false：collect 需要主臂做 HIL
+vla_ref: true              # actor 推理时输入 VLA 参考动作块
+play_sounds: true
+
+# RTC（分块执行时平滑衔接相邻动作块），以下为论文验证过的默认值
+rtc: true
+rtc_execution_horizon: 10                   # RLT 每次执行的步数
+vla_rtc_execution_horizon: 25               # VLA 每次执行的步数
+rtc_max_guidance_weight: 10.0
+rtc_prefix_attention_schedule: EXP          # EXP / LINEAR / ONES / ZEROS
+rtc_action_queue_size_to_get_new_actions: 30
+
+log_level: INFO
+dry_run: false

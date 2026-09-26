@@ -241,6 +241,20 @@ def set_teleop_manual_control(teleop: Teleoperator, enabled: bool) -> None:
         _set_so_leader_manual_control(teleop, enabled)
 
 
+def leader_teach_mode_active(teleop: Teleoperator | None) -> bool:
+    """Whether a leader with a hardware teach button (Piper) currently has it engaged.
+
+    A Piper leader in teach mode ignores CAN motion commands, so handing control back to
+    the policy would leave the leader free while the follower moves away from it; the
+    leader would then snap to the follower once the button is released. Leaders without
+    a teach button (SO-series) always report False.
+    """
+    is_teach_mode_active = getattr(teleop, "is_teach_mode_active", None)
+    if not callable(is_teach_mode_active):
+        return False
+    return bool(is_teach_mode_active())
+
+
 def _send_so_leader_feedback(teleop: Teleoperator, feedback: dict[str, float]) -> None:
     set_teleop_manual_control(teleop, False)
     goal_pos = {key.removesuffix(".pos"): val for key, val in feedback.items() if key.endswith(".pos")}
