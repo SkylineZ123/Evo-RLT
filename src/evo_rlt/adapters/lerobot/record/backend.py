@@ -64,9 +64,13 @@ lerobot-record \
 
 import json
 import logging
+import os
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
+
+import numpy as np
 
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -124,6 +128,7 @@ from lerobot.utils.constants import ACTION, OBS_STR, POLICY_PREPROCESSOR_DEFAULT
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
+    predict_action,
     sanity_check_dataset_name,
     sanity_check_dataset_robot_compatibility,
 )
@@ -517,6 +522,55 @@ def _write_schema_metadata(
     write_info(dataset.meta.info, dataset.root)
 
 
+# Call 1 runs torch.compile, call 2 captures the CUDA graphs (max-autotune), call 3 is steady state.
+COMPILE_WARMUP_CALLS = 3
+
+
+def _synthetic_observation_frame(dataset_features: dict[str, dict]) -> dict[str, np.ndarray]:
+    """All-zero observation frame with the recorded shapes, i.e. the shapes the policy sees at runtime."""
+    frame = {}
+    for key, feature in dataset_features.items():
+        if not key.startswith(f"{OBS_STR}."):
+            continue
+        dtype = np.uint8 if feature["dtype"] in ("image", "video") else np.dtype(feature["dtype"])
+        frame[key] = np.zeros(feature["shape"], dtype=dtype)
+    return frame
+
+
+def _warmup_compiled_policy(
+    cfg: RecordConfig, policy, preprocessor, postprocessor, dataset_features: dict[str, dict], robot_type: str
+) -> None:
+    """Pay the torch.compile cost before the robot connects, not on episode 0's first frame."""
+    if policy is None or not getattr(cfg.policy, "compile_model", False):
+        return
+    logging.info(
+        "Compiling the policy (torch.compile mode=%s, cache %s); a cold compile takes a few minutes.",
+        cfg.policy.compile_mode,
+        os.environ.get("TORCHINDUCTOR_CACHE_DIR", "torch default"),
+    )
+    frame = _synthetic_observation_frame(dataset_features)
+    device = get_safe_torch_device(policy.config.device)
+    start_t = time.perf_counter()
+    for _ in range(COMPILE_WARMUP_CALLS):
+        policy.reset()
+        preprocessor.reset()
+        postprocessor.reset()
+        predict_action(
+            observation=frame,
+            policy=policy,
+            device=device,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            use_amp=policy.config.use_amp,
+            task=cfg.dataset.single_task,
+            robot_type=robot_type,
+        )
+    policy.reset()
+    preprocessor.reset()
+    postprocessor.reset()
+    logging.info("Policy compiled and warmed up in %.0fs.", time.perf_counter() - start_t)
+
+
 def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
     from evo_rlt.adapters.lerobot.policies.modeling_rlt_ac import ChunkACPolicy
 
@@ -672,6 +726,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     "rename_observations_processor": {"rename_map": rename_map},
                 },
             )
+            _warmup_compiled_policy(cfg, policy, preprocessor, postprocessor, dataset.features, robot.robot_type)
 
         collector_policy_id_policy = cfg.collector_policy_id_policy
         collector_policy_id_human = cfg.collector_policy_id_human

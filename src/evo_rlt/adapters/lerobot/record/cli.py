@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from evo_rlt.adapters.lerobot.record.common import RESUME_LATEST
+from evo_rlt.adapters.lerobot.record.common import COMPILE_MODES, DEFAULT_COMPILE_CACHE_DIR, RESUME_LATEST
 from evo_rlt.adapters.lerobot.record.runner import run_collect, run_full, run_live, run_segment
 
 DEFAULT_COLLECT_DATASET_TAG = "vla_rlt_vla_test"
@@ -56,6 +56,18 @@ def add_common_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--default-episode-success", choices=["success", "failure"], default=None)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--dry-run", action="store_true", default=False)
+    parser.add_argument(
+        "--compile-model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="torch.compile a pi05 policy; compiles before the robot connects (minutes on a cold cache).",
+    )
+    parser.add_argument("--compile-mode", choices=COMPILE_MODES, default="max-autotune")
+    parser.add_argument(
+        "--compile-cache-dir",
+        default=str(DEFAULT_COMPILE_CACHE_DIR),
+        help="Disk cache for torch.compile artifacts, reused across runs and reboots (torch's default is /tmp).",
+    )
 
 
 def add_rtc_args(

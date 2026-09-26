@@ -12,6 +12,7 @@ from typing import Any
 
 from evo_rlt.adapters.lerobot import register
 from evo_rlt.adapters.lerobot.record.common import (
+    build_compile_overrides,
     build_dataset_argv,
     build_policy_overrides,
     build_rtc_argv,
@@ -25,6 +26,7 @@ from evo_rlt.adapters.lerobot.record.common import (
     print_dataset_target,
     remove_existing_dataset,
     resolve_record_paths,
+    set_compile_cache_dir,
     set_offline_env,
     stage_leader_calibrations,
     stage_setup_follower_calibrations,
@@ -675,6 +677,7 @@ def run_segment(args: argparse.Namespace) -> None:
             print(" ".join(sys.argv))
             return
 
+        apply_compile_cache_dir(args)
         prepare_lerobot_runtime(background_episode_video_encoding=True)
         from evo_rlt.adapters.lerobot.record.backend import record
 
@@ -735,12 +738,22 @@ def build_segment_policy_argv(args: argparse.Namespace) -> list[str]:
             rl_token_path=args.rl_token_path,
             phase_mode="always_vla",
             chunk_exec_steps=args.chunk_exec_steps,
-        )
+        ) + build_policy_compile_argv(args)
     return build_policy_overrides(
         policy_path=args.policy_path,
         vla_path=args.vla_path,
         rl_token_path=args.rl_token_path,
-    )
+    ) + build_policy_compile_argv(args)
+
+
+def build_policy_compile_argv(args: argparse.Namespace) -> list[str]:
+    return build_compile_overrides(args.policy_path, args.compile_mode if args.compile_model else None)
+
+
+def apply_compile_cache_dir(args: argparse.Namespace) -> None:
+    if not args.compile_model:
+        return
+    log.info("torch.compile cache dir: %s", set_compile_cache_dir(args.compile_cache_dir))
 
 
 def build_reset_time_argv(args: argparse.Namespace) -> list[str]:
@@ -805,6 +818,7 @@ def run_full(args: argparse.Namespace) -> None:
                 phase_mode=args.phase_mode,
                 chunk_exec_steps=args.chunk_exec_steps,
             ),
+            *build_policy_compile_argv(args),
             *build_dataset_argv(
                 dataset_name=paths.dataset_name,
                 dataset_root=paths.dataset_root,
@@ -832,6 +846,7 @@ def run_full(args: argparse.Namespace) -> None:
         if args.dry_run:
             print(" ".join(sys.argv))
             return
+        apply_compile_cache_dir(args)
         prepare_lerobot_runtime(
             double_tap_episode_outcome_key=(
                 args.episode_outcome_key if args.pedal_outcome else None

@@ -5,6 +5,7 @@
 # 按键（pedal_outcome: false）：s 结束 episode 并标 success，f 标 failure
 # 按键（pedal_outcome: true）：r（或踏板）单击标 success，双击标 failure
 # i 人工接管 / 交还（接管期间用主臂示教按钮拖动）  ← 重录当前 episode  Esc 结束
+# 没按 s/f 就用 ← / → / Esc（或超时）结束的 episode 没有成功标签，会被丢弃而不是保存。
 # 如需只录纯策略（不接主臂），设 no_teleop: true。
 
 command: full
@@ -16,11 +17,17 @@ initial_source: vla        # vla / teleop（teleop 即全程人工遥操作，�
 
 # 纯 VLA 评测时，policy_path 用 SFT 后的 pi0.5 即可，vla_path / rl_token_path 留空。
 # 若 policy_path 指向 rlt_ac checkpoint，则需同时设置 vla_path / rl_token_path，并用 phase_mode 控制。
-policy_path: /home/boss/zzq/Evo-RLT/output/checkpoint/blood_gas_teleop_0925/020000/pretrained_model
+policy_path: /home/boss/zzq/Evo-RLT/output/checkpoint/pi05/blood_gas_teleop_0925/020000/pretrained_model
 vla_path: null
 rl_token_path: null
 phase_mode: null           # rlt_ac 策略可设 always_vla / always_rl / manual
 chunk_exec_steps: null     # rlt_ac 策略每个 VLA 动作块执行的步数（如 25）
+
+# torch.compile（仅 pi05 策略）。4090 上每个动作块推理 341ms → 140ms（max-autotune），
+# 代价是启动时在连接机器人前先编译约 3 分钟（磁盘缓存命中后会更快）。
+compile_model: true
+compile_mode: max-autotune # max-autotune / default / max-autotune-no-cudagraphs / reduce-overhead
+compile_cache_dir: ~/.cache/evo_rlt/torchinductor/blood_gas_teleop_0925   # 编译缓存（计算图、autotune 结果、Triton kernel）
 
 num_episodes: 10
 episode_time_s: 3000

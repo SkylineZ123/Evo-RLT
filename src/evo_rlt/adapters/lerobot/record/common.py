@@ -461,6 +461,39 @@ def build_policy_overrides(
     return overrides
 
 
+COMPILE_MODES = ("max-autotune", "default", "max-autotune-no-cudagraphs", "reduce-overhead")
+DEFAULT_COMPILE_CACHE_DIR = Path.home() / ".cache" / "evo_rlt" / "torchinductor"
+# rlt_ac runs pi05 on a background RTC thread with a patched forward, which is not validated with
+# torch.compile/CUDA graphs; plain pi05 is.
+COMPILABLE_POLICY_TYPES = ("pi05",)
+
+
+def build_compile_overrides(policy_path: str | None, compile_mode: str | None) -> list[str]:
+    """`--policy.compile_model` overrides; `compile_mode=None` leaves the policy uncompiled."""
+    if compile_mode is None:
+        return []
+    if policy_path is None:
+        raise ValueError("--compile-model requires --policy-path")
+    policy_type = json.loads((Path(policy_path) / "config.json").read_text()).get("type")
+    if policy_type not in COMPILABLE_POLICY_TYPES:
+        raise ValueError(
+            f"--compile-model supports {list(COMPILABLE_POLICY_TYPES)} policies, got {policy_type!r} "
+            f"from {policy_path}"
+        )
+    return ["--policy.compile_model=true", f"--policy.compile_mode={compile_mode}"]
+
+
+def set_compile_cache_dir(cache_dir: str | Path) -> Path:
+    """Keep torch.compile's disk caches (compiled graphs, autotune picks, Triton kernels) in *cache_dir*.
+
+    torch defaults to /tmp/torchinductor_<user>, which is wiped at boot. Call before the first compile.
+    """
+    path = Path(cache_dir).expanduser().resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(path)
+    return path
+
+
 def build_rtc_argv(
     *,
     enabled: bool,
