@@ -31,6 +31,7 @@ from lerobot.policies.utils import make_robot_action
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
+    RenameObservationsProcessorStep,
     RobotAction,
     RobotObservation,
     RobotProcessorPipeline,
@@ -139,9 +140,15 @@ def _blend_robot_actions(
 
 
 def _validate_policy_image_features(
-    policy: PreTrainedPolicy, dataset_features: dict[str, dict]
+    policy: PreTrainedPolicy,
+    dataset_features: dict[str, dict],
+    preprocessor: PolicyProcessorPipeline | None = None,
 ) -> None:
-    """Check that dataset features include all image features the policy expects.
+    """Check that the dataset provides the image features the policy expects.
+
+    Dataset camera keys are compared after the preprocessor's rename step, since that
+    is what the policy actually sees. Policies like pi05 pad missing cameras as empty
+    images (as they did during training), so only a total miss is an error.
 
     Raises a clear error if images are missing - the most common cause is
     `--dataset.video=false` which silently drops all image features from the
@@ -155,12 +162,21 @@ def _validate_policy_image_features(
     if not policy_image_keys:
         return
 
+    rename_map: dict[str, str] = {}
+    for step in getattr(preprocessor, "steps", []):
+        if isinstance(step, RenameObservationsProcessorStep):
+            rename_map.update(step.rename_map)
     ds_image_keys = [
-        k for k, ft in dataset_features.items()
+        rename_map.get(k, k) for k, ft in dataset_features.items()
         if ft.get("dtype") in ("image", "video")
     ]
     missing = [k for k in policy_image_keys if k not in ds_image_keys]
-    if not missing:
+    if len(missing) < len(policy_image_keys):
+        if missing:
+            logging.warning(
+                "Policy image features %s have no dataset camera; they will be fed as empty cameras.",
+                missing,
+            )
         return
 
     hint = (
@@ -259,7 +275,7 @@ def record_loop(
 
     # Early check: verify dataset features include all image features the policy expects.
     if policy is not None and dataset is not None:
-        _validate_policy_image_features(policy, dataset.features)
+        _validate_policy_image_features(policy, dataset.features, preprocessor)
 
     action_feature_names = dataset.features[ACTION]["names"] if dataset is not None else None
     if action_feature_names is None:

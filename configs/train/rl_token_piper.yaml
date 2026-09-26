@@ -1,0 +1,58 @@
+# Piper 采血管插入任务的 RL token 训练（demo adaptation：pi0.5 冻结，只训 RL token 编解码器）
+#
+#   evo-rlt-train-rl-token --config configs/train/rl_token_piper.yaml
+#   evo-rlt-train-rl-token --config configs/train/rl_token_piper.yaml --steps 20000 --output-dir outputs/rl_token/exp2
+#   evo-rlt-train-rl-token --config configs/train/rl_token_piper.yaml \
+#       --resume-checkpoint outputs/rl_token/piper_blood_gas/demo_adapt_checkpoint.pt      # 续训
+#
+# 结构: 顶层与 rl_token / demo_adaptation 是 RLTConfig（下游 build_transition_cache / train_chunk_actor_critic
+# 也可直接用本文件，rl_token 段必须与训练时一致）；run 段是脚本的命令行参数（model_path == --model-path），
+# 命令行优先，写 null 表示沿用内置默认值。
+# pi0.5 在这里始终冻结，demo_adaptation.vla_ft_weight 只能为 0；要微调 VLA 请先跑 evo-rlt-train-pi05-sft。
+
+seed: 0
+action_dim: 7             # piper: 6 个关节 + 夹爪
+proprio_dim: 7
+
+rl_token:
+  token_dim: 2048         # 必须等于 pi0.5 PaliGemma 的 hidden size（2048）
+  nhead: 8                # 注意力头数，token_dim 需能被整除
+  enc_layers: 3           # 编码器层数：把 VLA 前缀 token 压缩成 RL token
+  dec_layers: 3           # 解码器层数：只在训练时用于重建，推理不需要
+  ff_dim: 4096            # Transformer FFN 宽度；null = 4 * token_dim
+  num_rl_tokens: 4        # 可学习 RL token 个数；下游取均值成一个 2048 维向量
+
+demo_adaptation:
+  steps: 50000            # 总训练步数（含 warmup）
+  batch_size: 2           # 每步样本数
+  lr: 2.0e-4              # 峰值学习率（Adam）
+  warmup_steps: 2000      # 线性 warmup 步数，之后余弦衰减到 min_lr
+  min_lr: 5.0e-6          # 余弦衰减的终点学习率
+  grad_clip_norm: 1.0     # 梯度裁剪的 L2 范数上限
+
+run:
+  # ---- 模型 / 数据 ----
+  model_path: /home/boss/zzq/Evo-RLT/output/checkpoint/blood_gas_teleop_0925/020000/pretrained_model   # SFT 后的 pi0.5
+  demo_dataset_path: /home/boss/lerobot_datasets/piper/0925_blood_gas_insertion_20260925/teleop_154125
+  task_instruction: null  # null = 用数据集自带的 task（与 SFT 训练时的 prompt 一致）
+  camera_name_map:        # 数据集相机 -> pi0.5 相机槽位，必须与 SFT 的 rename_map 一致
+    front: observation.images.base_0_rgb
+    wrist: observation.images.right_wrist_0_rgb
+  normalize: true         # 按数据集 q01/q99 把状态归一化到 [-1, 1]（pi0.5 / build_transition_cache 同款）
+  tokenizer_path: null    # null = google/paligemma-3b-pt-224（本地 HF 缓存）
+  vla_cache_dir: null
+  dtype: bfloat16
+
+  # ---- RL token 输入 ----
+  image_only: false       # true = 丢掉语言/状态 token，只用图像 patch token
+  active_cameras: null    # 例如 [front, wrist]；设置后隐含 image_only，只保留这些相机的 token
+  token_pool_size: 0      # >0 时先把前缀 token 平均池化到这么多个再编码
+  norm_stats: null        # evo-rlt-compute-token-variance 输出的 .pt，用于逐维加权重建损失
+  norm_gamma: 0.0         # 0 = 普通 MSE，0.5 = 部分白化，1 = 完全白化
+
+  # ---- 训练 ----
+  output_dir: outputs/rl_token/piper_blood_gas
+  device: cuda
+  num_workers: 4
+  save_every: 2000
+  resume_checkpoint: null

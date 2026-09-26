@@ -6,6 +6,8 @@ import sys
 from evo_rlt.adapters.lerobot.record.common import RESUME_LATEST
 from evo_rlt.adapters.lerobot.record.runner import run_collect, run_full, run_live, run_segment
 
+DEFAULT_COLLECT_DATASET_TAG = "vla_rlt_vla_test"
+DEFAULT_COLLECT_TASK = "Insert the copper screw into the black sleeve."
 
 def run_teleop(args: argparse.Namespace) -> None:
     from evo_rlt.adapters.lerobot.record.teleop_collect import run_teleop as _run_teleop
@@ -19,8 +21,6 @@ def run_replay(args: argparse.Namespace) -> None:
     _run_replay(args)
 
 
-DEFAULT_COLLECT_DATASET_TAG = "vla_rlt_vla_test"
-DEFAULT_COLLECT_TASK = "Insert the copper screw into the black sleeve."
 
 
 def add_resume_arg(parser: argparse.ArgumentParser) -> None:

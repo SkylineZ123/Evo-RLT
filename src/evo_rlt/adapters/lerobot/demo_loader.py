@@ -213,6 +213,7 @@ def make_demo_loader(
     num_workers: int = 2,
     device: str = "cuda",
     tolerance_s: float = 0.04,
+    normalize_actions: bool = False,
 ) -> Iterator[tuple[Observation, torch.Tensor]]:
     """Create an infinite-cycling DataLoader for demo adaptation.
 
@@ -224,6 +225,7 @@ def make_demo_loader(
         chunk_length=chunk_length,
         camera_keys=camera_keys,
         image_size=image_size,
+        normalize_actions=normalize_actions,
         tolerance_s=tolerance_s,
     )
     loader = DataLoader(

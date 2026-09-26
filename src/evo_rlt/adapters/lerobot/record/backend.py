@@ -62,6 +62,7 @@ lerobot-record \
 ```
 """
 
+import json
 import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -119,7 +120,7 @@ from lerobot.teleoperators import (  # noqa: F401
     so_leader,
     unitree_g1,
 )
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_STR, POLICY_PREPROCESSOR_DEFAULT_NAME
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -480,6 +481,23 @@ def _build_collector_policy_id_codebook(cfg: RecordConfig) -> dict[str, str]:
     }
 
 
+def _resolve_rename_map(cfg: RecordConfig) -> dict[str, str]:
+    """`--dataset.rename_map`, or else the camera renames the policy was trained with.
+
+    Training saves its rename_map in the checkpoint's preprocessor; without this fallback the
+    record-time override would replace it with `{}` and the cameras would reach the policy unrenamed.
+    """
+    if cfg.dataset.rename_map or cfg.policy is None or not cfg.policy.pretrained_path:
+        return cfg.dataset.rename_map
+    config_path = Path(cfg.policy.pretrained_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
+    if not config_path.is_file():
+        return {}
+    for step in json.loads(config_path.read_text()).get("steps", []):
+        if step.get("registry_name") == "rename_observations_processor":
+            return dict(step.get("config", {}).get("rename_map") or {})
+    return {}
+
+
 def _write_schema_metadata(
     dataset: LeRobotDataset,
     *,
@@ -631,7 +649,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         )
 
         # Load pretrained policy
-        policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
+        rename_map = _resolve_rename_map(cfg)
+        if rename_map:
+            logging.info("Policy camera rename_map: %s", rename_map)
+        policy = (
+            None
+            if cfg.policy is None
+            else make_policy(cfg.policy, ds_meta=dataset.meta, rename_map=rename_map)
+        )
         _configure_rlt_record_policy(policy, cfg)
         preprocessor = None
         postprocessor = None
@@ -641,10 +666,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             preprocessor, postprocessor = make_pre_post_processors(
                 policy_cfg=cfg.policy,
                 pretrained_path=cfg.policy.pretrained_path,
-                dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
+                dataset_stats=rename_stats(dataset.meta.stats, rename_map),
                 preprocessor_overrides={
                     "device_processor": {"device": cfg.policy.device},
-                    "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
+                    "rename_observations_processor": {"rename_map": rename_map},
                 },
             )
 
@@ -808,6 +833,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
         def _resolve_current_episode_success() -> str | None:
             if not cfg.enable_episode_outcome_labeling:
+                return None
+            if (
+                cfg.require_episode_success_label
+                and events.get("episode_outcome") is None
+                and cfg.default_episode_success is None
+            ):
+                # ←, →, Esc or the episode timeout ended it before s/f: an unlabeled episode
+                # cannot be saved, so discard it through the re-record path instead of raising.
+                if not events["rerecord_episode"]:
+                    logging.warning(
+                        "Episode %s ended without a success/failure label; discarding it. "
+                        "Press the success/failure key to end an episode you want to keep.",
+                        dataset.num_episodes,
+                    )
+                events["rerecord_episode"] = True
                 return None
             episode_success = resolve_episode_success_label(
                 explicit_label=events.get("episode_outcome"),

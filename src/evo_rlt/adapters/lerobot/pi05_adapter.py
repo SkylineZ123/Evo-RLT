@@ -18,6 +18,19 @@ from evo_rlt.core.interfaces import Observation, VLAOutput
 from evo_rlt.core.utils import postprocess_prefix_tokens
 from evo_rlt.core.vla_adapter import VLAAdapter
 
+# pi0.5 camera slots, in prefix-token order.
+PI05_CAMERA_SLOTS = [
+    "observation.images.base_0_rgb",
+    "observation.images.left_wrist_0_rgb",
+    "observation.images.right_wrist_0_rgb",
+]
+# Short dataset camera name (`observation.images.<name>`) -> pi0.5 slot, for the bimanual rig.
+DEFAULT_CAMERA_NAME_MAP = {
+    "left_wrist": "observation.images.left_wrist_0_rgb",
+    "right_wrist": "observation.images.right_wrist_0_rgb",
+    "right_front": "observation.images.base_0_rgb",
+}
+
 
 def _tie_embed_tokens(pi05_policy: PI05Policy) -> None:
     """Restore tied language embeddings when SFT checkpoints omit embed_tokens."""
@@ -54,16 +67,11 @@ class Pi05VLAAdapter(VLAAdapter):
         self.token_pool_size = token_pool_size
         self.image_only = image_only
 
-        self.camera_name_map = camera_name_map or {
-            "left_wrist": "observation.images.left_wrist_0_rgb",
-            "right_wrist": "observation.images.right_wrist_0_rgb",
-            "right_front": "observation.images.base_0_rgb",
-        }
-        self.camera_order = [
-            "observation.images.base_0_rgb",
-            "observation.images.left_wrist_0_rgb",
-            "observation.images.right_wrist_0_rgb",
-        ]
+        self.camera_name_map = dict(camera_name_map or DEFAULT_CAMERA_NAME_MAP)
+        self.camera_order = list(PI05_CAMERA_SLOTS)
+        unknown_slots = sorted(set(self.camera_name_map.values()) - set(self.camera_order))
+        if unknown_slots:
+            raise ValueError(f"camera_name_map targets {unknown_slots} are not pi0.5 camera slots {self.camera_order}")
 
         pi05_config = PI05Config(
             device=device,
@@ -211,13 +219,10 @@ class Pi05VLAAdapter(VLAAdapter):
         masks = encoded["attention_mask"].to(device=device, dtype=torch.bool)
         return tokens, masks
 
-    @torch.no_grad()
-    def forward_vla(self, obs: Observation) -> VLAOutput:
+    def _forward_prefix(self, obs: Observation, use_cache: bool):
+        """Run the PaliGemma prefix (images + language/state tokens) once."""
         images, img_masks = self._prepare_images(obs)
         tokens, masks = self._prepare_language_tokens(obs)
-
-        batch_size = tokens.shape[0]
-        device = tokens.device
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.pi05.embed_prefix(
             images,
@@ -236,9 +241,31 @@ class Pi05VLAAdapter(VLAAdapter):
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+            use_cache=use_cache,
         )
-        prefix_output = outputs[0]
+        return outputs[0], past_key_values, prefix_pad_masks
+
+    def _postprocess_prefix(self, prefix_output: torch.Tensor) -> torch.Tensor:
+        return postprocess_prefix_tokens(
+            prefix_output.to(dtype=torch.float32),
+            image_only=self.image_only,
+            num_image_tokens=self._num_image_tokens,
+            pool_size=self.token_pool_size,
+            num_per_camera=self._num_per_camera,
+            active_camera_indices=self._active_camera_indices,
+        )
+
+    @torch.no_grad()
+    def prefix_tokens(self, obs: Observation) -> torch.Tensor:
+        """final_tokens only: skips the action-expert denoising loop that forward_vla runs."""
+        prefix_output, _, _ = self._forward_prefix(obs, use_cache=False)
+        return self._postprocess_prefix(prefix_output)
+
+    @torch.no_grad()
+    def forward_vla(self, obs: Observation) -> VLAOutput:
+        prefix_output, past_key_values, prefix_pad_masks = self._forward_prefix(obs, use_cache=True)
+        batch_size = prefix_output.shape[0]
+        device = prefix_output.device
 
         x_t = self.pi05.sample_noise(
             (batch_size, self.pi05_config.chunk_size, self.pi05_config.max_action_dim),
@@ -259,17 +286,8 @@ class Pi05VLAAdapter(VLAAdapter):
 
         sampled_actions = x_t[:, :, : self.actual_action_dim]
 
-        final_tokens = postprocess_prefix_tokens(
-            prefix_output.to(dtype=torch.float32),
-            image_only=self.image_only,
-            num_image_tokens=self._num_image_tokens,
-            pool_size=self.token_pool_size,
-            num_per_camera=self._num_per_camera,
-            active_camera_indices=self._active_camera_indices,
-        )
-
         return VLAOutput(
-            final_tokens=final_tokens,
+            final_tokens=self._postprocess_prefix(prefix_output),
             sampled_action_chunk=sampled_actions.to(dtype=torch.float32),
         )
 

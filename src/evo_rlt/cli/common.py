@@ -23,14 +23,26 @@ def configure_logging(name: str) -> logging.Logger:
 
 
 def load_training_config(config_path: str | None):
+    """Load an RLT YAML config; shape fields the YAML leaves out get the 12-dim bimanual defaults."""
+    import yaml
+
     from evo_rlt.core.config import RLTConfig
 
     config = RLTConfig.from_yaml(config_path) if config_path else RLTConfig()
-    config.action_dim = DEFAULT_ACTION_DIM
-    config.proprio_dim = DEFAULT_PROPRIO_DIM
-    config.vla_horizon = DEFAULT_VLA_HORIZON
-    config.chunk_length = DEFAULT_CHUNK_LENGTH
-    config.cameras = list(DEFAULT_CAMERAS)
+    raw = {}
+    if config_path:
+        with open(config_path) as fh:
+            raw = yaml.safe_load(fh) or {}
+    defaults = {
+        "action_dim": DEFAULT_ACTION_DIM,
+        "proprio_dim": DEFAULT_PROPRIO_DIM,
+        "vla_horizon": DEFAULT_VLA_HORIZON,
+        "chunk_length": DEFAULT_CHUNK_LENGTH,
+        "cameras": list(DEFAULT_CAMERAS),
+    }
+    for key, value in defaults.items():
+        if key not in raw:
+            setattr(config, key, value)
     return config
 
 
@@ -46,6 +58,7 @@ def build_pi05_policy(
     image_only: bool = False,
     active_cameras: list[str] | None = None,
     tokenizer_path: str | None = None,
+    camera_name_map: dict[str, str] | None = None,
 ):
     from evo_rlt.adapters.lerobot.pi05_adapter import Pi05VLAAdapter
     from evo_rlt.core.policy import RLTPolicy
@@ -55,6 +68,7 @@ def build_pi05_policy(
         model_path=model_path,
         actual_action_dim=config.action_dim,
         actual_proprio_dim=config.proprio_dim,
+        camera_name_map=camera_name_map,
         task_instruction=task_instruction,
         dtype=dtype,
         device=device,

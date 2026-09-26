@@ -114,7 +114,9 @@ class RLTConfig:
         """Load config from a YAML file, using defaults for missing fields."""
         path = Path(path)
         with open(path) as f:
-            raw = yaml.safe_load(f)
+            raw = yaml.safe_load(f) or {}
+        # `run:` holds an entry point's CLI options (see cli/train_rl_token.py), not RLTConfig fields.
+        raw.pop("run", None)
 
         sub_configs = {}
         for key, subcls in [

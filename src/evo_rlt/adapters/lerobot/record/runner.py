@@ -43,9 +43,6 @@ def prepare_lerobot_runtime(
 ) -> None:
     if double_tap_episode_outcome_key is not None and double_tap_episode_outcome_window_s is None:
         raise ValueError("double_tap_episode_outcome_window_s is required")
-    # Always installed: LeRobot 0.5.1's `init_keyboard_listener()` takes no arguments, while
-    # `backend.record` passes the HIL/RLT key bindings as keyword arguments. Must run before
-    # `backend` is first imported, since it binds the function at import time.
     _patch_double_tap_episode_outcome_listener(
         double_tap_episode_outcome_window_s or 0.0,
         double_tap_episode_outcome_key,

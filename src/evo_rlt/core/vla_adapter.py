@@ -20,6 +20,10 @@ class VLAAdapter(ABC, nn.Module):
         """Single forward pass returning final token embeddings + sampled action chunk."""
         ...
 
+    def prefix_tokens(self, obs: Observation) -> torch.Tensor:
+        """final_tokens only. Override when tokens are cheaper to get than a full forward_vla."""
+        return self.forward_vla(obs).final_tokens
+
     @abstractmethod
     def supervised_loss(self, obs: Observation, expert_actions: torch.Tensor) -> torch.Tensor:
         """Action prediction loss for optional VLA fine-tuning on demos."""

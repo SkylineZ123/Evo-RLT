@@ -109,12 +109,11 @@ def demo_adaptation(
         for pg in demo_optimizer.param_groups:
             pg["lr"] = lr
 
-        vla_out = policy.vla.forward_vla(obs)
-        l_ro = rl_token_full.reconstruction_loss(
-            vla_out.final_tokens, dim_std=dim_std, gamma=norm_gamma,
+        loss = rl_token_full.reconstruction_loss(
+            policy.vla.prefix_tokens(obs), dim_std=dim_std, gamma=norm_gamma,
         )
-        l_vla = policy.vla.supervised_loss(obs, expert_actions)
-        loss = l_ro + alpha * l_vla
+        if alpha > 0:
+            loss = loss + alpha * policy.vla.supervised_loss(obs, expert_actions)
 
         demo_optimizer.zero_grad()
         loss.backward()
