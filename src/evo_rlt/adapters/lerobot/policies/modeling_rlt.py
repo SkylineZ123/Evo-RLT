@@ -288,6 +288,8 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
         from lerobot.policies.pi05.configuration_pi05 import PI05Config
         from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
+        from evo_rlt.adapters.lerobot.fast_init import install_pi05_fast_load
+
         cfg = self.config
         log.info("Loading PI05 backbone from %s", cfg.vla_pretrained_path)
 
@@ -295,6 +297,7 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
         if cfg.task_instruction:
             pi05_config.task_instruction = cfg.task_instruction
 
+        install_pi05_fast_load()
         pi05 = PI05Policy.from_pretrained(
             cfg.vla_pretrained_path,
             config=pi05_config,

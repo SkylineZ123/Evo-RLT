@@ -1,0 +1,12 @@
+{
+  "robot_type": "piper",
+  "datasets": {"root": "~/lerobot_datasets/piper"},
+  "arms": [
+    {"alias": "follower", "type": "follower", "port": "can_follower", "speed_percent": 60},
+    {"alias": "leader", "type": "leader", "port": "can_leader"}
+  ],
+  "cameras": [
+    {"alias": "wrist", "type": "realsense", "serial": "148522072680", "width": 640, "height": 480, "fps": 30},
+    {"alias": "front", "type": "realsense", "serial": "327122074756", "width": 640, "height": 480, "fps": 30}
+  ]
+}

@@ -57,7 +57,7 @@
 | [⚡ Quick Start](#quick-start) | [🧪 Training Pipeline](#training-pipeline) | [🤗 Model & Dataset](#model-dataset) |
 | [1) Installation](#installation) | [3) Finetune VLA](#finetune-vla) | [🗂️ Repository Layout](#repository-layout) |
 | [2) Hardware Setup](#hardware-setup) | [4) Train RL Token](#train-rl-token) | [✅ Development Checks](#development-checks) |
-| [🤖 Real-Robot Recording and Deployment](#real-robot-recording-and-deployment) | [5) Build Transition Cache](#build-transition-cache) | [🧭 Future TODO](#future-todo) |
+| [🤖 Real-Robot Recording and Deployment](#real-robot-recording-and-deployment) / [🦾 PiPER](#piper-single-arm) | [5) Build Transition Cache](#build-transition-cache) | [🧭 Future TODO](#future-todo) |
 | | [6) Train Chunk Actor-Critic](#train-chunk-actor-critic) | [💬 Community Channels](#community-channels) / [🏫 Affiliations](#affiliations) / [📄 License](#license) |
 
 <a id="quick-start"></a>
@@ -114,7 +114,7 @@ Only migrate normalization for checkpoints trained before LeRobot's processor-pi
 
 ### 2) Hardware Setup
 
-Use the [Evo-RL hardware setup](https://github.com/MINT-SJTU/Evo-RL#2-hardware-setup) for the shared SO-series robot bring-up steps: assembly, stable serial/camera paths, camera validation, and basic teleoperation checks. PiPER/PiPER-X support is planned; see [Future TODO](#future-todo).
+Use the [Evo-RL hardware setup](https://github.com/MINT-SJTU/Evo-RL#2-hardware-setup) for the shared SO-series robot bring-up steps: assembly, stable serial/camera paths, camera validation, and basic teleoperation checks. For a single-arm AgileX PiPER, see [PiPER Single-Arm Recording and HIL](#piper-single-arm).
 
 This repository only differs at the recording/deployment configuration layer:
 
@@ -200,7 +200,22 @@ For saved checkpoints, LeRobot `0.5.1` writes numeric checkpoint directories suc
 
 ### 3) Finetune VLA
 
-Use LeRobot's training entrypoint to finetune a pi0.5 VLA checkpoint on a LeRobot dataset.
+`evo-rlt-train-pi05-sft` wraps LeRobot's `lerobot_train` (same loss, optimizer preset, checkpoints) with a YAML config, wandb, resume and multi-GPU launch. Keys in the YAML are the CLI option names; CLI flags override the file, and unknown flags are forwarded to `lerobot_train`.
+
+```bash
+# new run (edit dataset_root / rename_map / output_dir in the YAML first)
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml
+# two GPUs (DDP via accelerate launch; effective batch = batch_size x num_gpus)
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --num-gpus 2
+# resume output_dir from checkpoints/last (optionally extend --steps); wandb continues the same run
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --resume --steps 50000
+# print the underlying lerobot_train command without running it
+evo-rlt-train-pi05-sft --config configs/train/pi05_sft_piper_blood_gas.yaml --dry-run
+```
+
+`rename_map` maps the dataset cameras onto pi05_base's camera slots (`base_0_rgb`, `left_wrist_0_rgb`, `right_wrist_0_rgb`); unused slots are filled with empty images, which still cost a SigLIP pass and 256 masked prefix tokens each — `drop_unused_cameras: true` removes those slots from the policy config instead (saved with the checkpoints, so deployment uses the same cameras). `compile_model: true` enables `torch.compile` on the policy forward. Set `wandb: false` or `--wandb-mode offline` if wandb is not logged in.
+
+The equivalent raw LeRobot command:
 
 ```bash
 python -m lerobot.scripts.lerobot_train \
@@ -415,6 +430,92 @@ single tap    success, end current episode, start next episode
 double tap    failure, end current episode, start next episode
 ```
 
+<a id="piper-single-arm"></a>
+
+## 🦾 PiPER Single-Arm Recording and HIL
+
+A single AgileX PiPER follower with a PiPER leader arm is supported through an Evo-RLT driver plugin (`evo_rlt.adapters.lerobot.hardware.piper`), which registers `--robot.type=piper` and `--teleop.type=piper_leader` with LeRobot `0.5.1`. Install the CAN SDK and RealSense bindings:
+
+```bash
+python -m pip install -e ".[lerobot,piper]"
+```
+
+Set `"robot_type": "piper"` in the setup manifest. Arm `port` entries are CAN interface names. The leader runs in absolute passthrough, so no calibration files are needed:
+
+```json
+{
+  "robot_type": "piper",
+  "datasets": {"root": "/path/to/lerobot_datasets"},
+  "arms": [
+    {"alias": "follower", "type": "follower", "port": "can_follower", "speed_percent": 60},
+    {"alias": "leader", "type": "leader", "port": "can_leader"}
+  ],
+  "cameras": [
+    {"alias": "wrist", "type": "realsense", "serial": "<serial>", "width": 640, "height": 480, "fps": 30},
+    {"alias": "front", "type": "realsense", "serial": "<serial>", "width": 640, "height": 480, "fps": 30}
+  ]
+}
+```
+
+State and action are 7-dimensional: `joint_1..joint_6` in radians and `joint_7` for the gripper opening in meters. Use `proprio_dim=7` and record at `--fps 30`, because the transition-cache builders assume 30 fps.
+
+Every `evo-rlt-record` subcommand also accepts `--config <file>.yaml`. Keys are option names (`policy_path` or `policy-path`), an optional `command:` selects the subcommand, `null` keeps the built-in default, and flags on the command line override the file. Ready-made PiPER configs live in `configs/record/` (`piper_teleop.yaml`, `piper_collect_hil.yaml`, `piper_segment.yaml`, `piper_full_vla.yaml`, plus the `piper_setup.json` manifest):
+
+```bash
+evo-rlt-record --config configs/record/piper_collect_hil.yaml --num-episodes 3
+```
+
+### Teleoperation demos (for pi0.5 SFT)
+
+```bash
+evo-rlt-record teleop --setup-json piper.json --task "<TASK>" --num-episodes 50
+```
+
+At startup, the follower is ramped onto the leader's pose. Then press the teach button on the leader (it lights up green) to drag it. Controls:
+
+```text
+c        start recording, or resume after a pause
+space    pause / resume inside the same episode
+s        save the episode (labelled success)
+r        discard the episode
+q / Esc  stop the session (--stop-pending save|discard decides the unsaved buffer)
+```
+
+Saved episodes carry `episode_success=success`, so the same dataset feeds SFT and `evo-rlt-build-bucket-cache --bucket-mode human_expert`. Add `--status-view` for a live camera and status window.
+
+### Rollout with human intervention
+
+`evo-rlt-record collect|segment|full` work unchanged with a PiPER manifest. After connecting, the leader is ramped onto the follower's pose, so the first policy-synced command is small. The policy then drives both arms. The intervention sequence is:
+
+```text
+space               enter intervention; the leader stops being commanded and holds its pose
+teach button (on)   the leader becomes draggable; the follower tracks it
+teach button (off)  the leader leaves teach mode
+space               hand control back to the policy
+```
+
+`space` is refused while the teach button is still engaged, because the policy cannot drive a leader in teach mode. An episode that starts with teach mode engaged begins in intervention.
+
+### Resuming a dataset
+
+Every recording subcommand (`teleop`, `collect`, `segment`, `full`) accepts `--resume` to append to an existing dataset instead of starting a new one:
+
+```bash
+evo-rlt-record --config configs/record/piper_teleop.yaml --resume          # latest dataset of this dataset_tag
+evo-rlt-record --config configs/record/piper_teleop.yaml --resume <datasets.root>/<MMDD>_<tag>/teleop_<HHMMSS>
+```
+
+A bare `--resume` (or `resume: true` in YAML) picks the most recently written dataset that has saved episodes under `<datasets.root>/<MMDD>_<dataset_tag>/<prefix>_<HHMMSS>`, where the prefix is `teleop`, `eval_vla_rlt_vla`, `eval_<source>_segment`, or `eval_<source>_full`. The command refuses datasets whose last session did not finalize, datasets with no saved episodes, and datasets whose fps, robot type, or features (including cameras) differ from the current setup. It warns when `--task` is new to the dataset. When resuming, `--num-episodes` counts the episodes recorded in this session.
+
+### Replaying episodes (dataset QA)
+
+```bash
+evo-rlt-record replay --setup-json configs/record/piper_setup.json \
+  --dataset-root <datasets.root>/<MMDD>_<tag>/teleop_<HHMMSS> --episodes 0 1 --speed 0.5
+```
+
+Each episode is first checked offline for empty or non-finite data and for joint jumps larger than `--max-step-deg` between consecutive frames. Flagged episodes are skipped. `--dry-run` runs only this check. On the robot, only the follower is enabled. It ramps slowly onto the episode's first frame and waits for Enter so you can reset the scene (`--no-confirm` skips this). Then it streams the recorded `action` (`--source state` streams `observation.state` instead). At the end, the command prints the per-joint RMSE and maximum error between the measured joints and the recorded `observation.state`. `--save-trace DIR` saves the command, recorded state and measured state for each episode as `.npz` files.
+
 <a id="repository-layout"></a>
 
 ## 🗂️ Repository Layout
@@ -447,7 +548,7 @@ PYTHONPATH=src python -m compileall -q src/evo_rlt tests/rlt
 
 ## 🧭 Future TODO
 
-- PiPER/PiPER-X real-robot deployment support.
+- PiPER-X and dual-arm PiPER recording support.
 
 <a id="community-channels"></a>
 

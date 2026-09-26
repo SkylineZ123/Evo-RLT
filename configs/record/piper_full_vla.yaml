@@ -1,0 +1,47 @@
+# Piper 整条轨迹录制：纯 VLA 执行，用于评测 SFT 模型或采集 warmup_vla 数据
+#
+#   evo-rlt-record --config configs/record/piper_full_vla.yaml
+#
+# 按键（pedal_outcome: false）：s 结束 episode 并标 success，f 标 failure
+# 按键（pedal_outcome: true）：r（或踏板）单击标 success，双击标 failure
+# i 人工接管 / 交还（接管期间用主臂示教按钮拖动）  ← 重录当前 episode  Esc 结束
+# 如需只录纯策略（不接主臂），设 no_teleop: true。
+
+command: full
+
+setup_json: configs/record/piper_setup.json
+task: "Pick up the peg and insert it into the hole."   # ← 与 SFT 时一致
+
+initial_source: vla        # vla / teleop（teleop 即全程人工遥操作，但示教采集更推荐 piper_teleop.yaml）
+
+# 纯 VLA 评测时，policy_path 用 SFT 后的 pi0.5 即可，vla_path / rl_token_path 留空。
+# 若 policy_path 指向 rlt_ac checkpoint，则需同时设置 vla_path / rl_token_path，并用 phase_mode 控制。
+policy_path: outputs/vla_ft/checkpoints/last/pretrained_model
+vla_path: null
+rl_token_path: null
+phase_mode: null           # rlt_ac 策略可设 always_vla / always_rl / manual
+chunk_exec_steps: null     # rlt_ac 策略每个 VLA 动作块执行的步数（如 25）
+
+num_episodes: 10
+episode_time_s: 3000
+reset_time_s: null
+fps: 30
+dataset_tag: piper_full_vla
+resume: null               # 接着已有数据集采集：true = 本 dataset_tag 下最近一次有数据的数据集；也可填数据集目录；null = 新建
+vcodec: h264
+
+pedal_outcome: false       # true：用 episode_outcome_key 单击/双击（及踏板）标记成功/失败
+episode_outcome_key: r     # 仅 pedal_outcome: true 时生效
+double_tap_window_s: 0.6
+default_episode_success: null
+no_teleop: false
+
+rtc: true
+rtc_execution_horizon: 10
+vla_rtc_execution_horizon: null
+rtc_max_guidance_weight: 10.0
+rtc_prefix_attention_schedule: EXP
+rtc_action_queue_size_to_get_new_actions: null
+
+log_level: INFO
+dry_run: false

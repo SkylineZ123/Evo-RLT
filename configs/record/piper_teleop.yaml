@@ -1,0 +1,24 @@
+# Piper 遥操作示教采集（用于 pi0.5 SFT 和 human_expert bucket）
+#
+#   evo-rlt-record --config configs/record/piper_teleop.yaml
+#   evo-rlt-record --config configs/record/piper_teleop.yaml --num-episodes 10   # 命令行参数覆盖 YAML
+#
+# 按键：c 开始/继续  space 暂停/继续（不切分 episode）  s 保存（标 success）  r 丢弃  q/Esc 结束
+# 启动时从臂先慢速对齐到主臂，之后按主臂示教按钮（绿灯）拖动。
+# 键名与命令行参数一一对应（policy_path == --policy-path）；写 null 表示沿用内置默认值。
+
+command: teleop
+
+setup_json: /home/boss/zzq/Evo-RLT/configs/record/piper_setup.json   # 机器人 manifest（CAN 口、相机序列号、数据集根目录）
+task: "pick up the blood gas sample and insert it into the sampling needle of blood gas analyzer ."   # ← 改成你的任务描述；SFT、cache、rollout 必须一致
+
+num_episodes: 50          # 本次保存满这么多条后自动结束（resume 时为新增条数）
+fps: 30                   # 必须为 30：transition cache 构建脚本写死了 30 fps
+dataset_tag: blood_gas_insertion_20260925 # 数据集目录：<datasets.root>/<月日>_<dataset_tag>/teleop_<时分秒>
+vcodec: h264
+
+align_time_s: 3.0         # 启动时从臂对齐到主臂的时长（秒）
+stop_pending: discard     # 按 q 时缓冲区里未保存的 episode：save 或 discard
+status_view: true         # 打开相机 + 录制状态窗口
+resume: true              # 接着已有数据集采集：true = 本 dataset_tag 下最近一次有数据的数据集；也可填数据集目录；null = 新建
+log_level: INFO

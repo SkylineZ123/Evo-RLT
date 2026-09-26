@@ -105,6 +105,7 @@ from evo_rlt.adapters.lerobot.record.hil import (
     _predict_policy_action_with_acp_inference,  # noqa: F401
 )
 from evo_rlt.adapters.lerobot.record.loop import record_loop
+from evo_rlt.adapters.lerobot.record.piper_session import is_piper_leader, prepare_piper_leader
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
@@ -324,6 +325,9 @@ class RecordConfig:
     # inference (mirrors training ref-dropout). RL phase only; VLA passthrough
     # and non-rlt_ac policies are unaffected.
     vla_ref: bool = True
+    # Piper leader only: seconds spent ramping the leader and follower onto one pose after
+    # connect (the leader cannot be backdriven from software, so neither arm may jump).
+    piper_align_time_s: float = 3.0
 
     def __post_init__(self):
         if self.robot_config_file is not None:
@@ -588,21 +592,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     try:
         if cfg.resume:
-            dataset = LeRobotDataset(
+            # `resume()`, not the constructor: in LeRobot 0.5.1 the constructor keeps a reader, so
+            # `num_episodes` would stop advancing, and `start_image_writer` lives on the writer.
+            dataset = LeRobotDataset.resume(
                 cfg.dataset.repo_id,
                 root=cfg.dataset.root,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
+                image_writer_processes=cfg.dataset.num_image_writer_processes,
+                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
                 encoder_threads=cfg.dataset.encoder_threads,
             )
-
-            if hasattr(robot, "cameras") and len(robot.cameras) > 0:
-                dataset.start_image_writer(
-                    num_processes=cfg.dataset.num_image_writer_processes,
-                    num_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
-                )
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
             # Create empty dataset or load existing saved episodes
@@ -655,6 +657,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         on_record_connected = getattr(cfg, "_on_record_connected", None)
         if callable(on_record_connected):
             on_record_connected(robot, teleop)
+        if teleop is not None and is_piper_leader(teleop):
+            prepare_piper_leader(
+                robot,
+                teleop,
+                operator_first=policy is None or cfg.rlt.start_in_teleop,
+                align_time_s=cfg.piper_align_time_s,
+                fps=cfg.dataset.fps,
+            )
 
         if cfg.policy_sync_to_teleop:
             if cfg.policy is None:

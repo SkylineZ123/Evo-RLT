@@ -43,6 +43,7 @@ from evo_rlt.adapters.lerobot.record.hil import (
     ACPInferenceConfig,
     PolicySyncDualArmExecutor,
     _capture_policy_runtime_state,
+    leader_teach_mode_active,
     set_teleop_manual_control as apply_teleop_manual_control,
     _predict_policy_action_with_acp_inference,
 )
@@ -311,6 +312,24 @@ def record_loop(
         cond_policy_runtime_state = _capture_policy_runtime_state(policy)
         uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
 
+    def teach_mode_blocks_release() -> bool:
+        """Keep the human in control while a Piper leader's teach button is still engaged."""
+        if not leader_teach_mode_active(teleop_arm_for_mode_switch):
+            return False
+        logging.warning(
+            "Leader is still in teach mode: press the teach button on the leader arm to exit "
+            "teach mode first, then press the toggle key again. Staying in intervention (S1)."
+        )
+        log_say("exit teach mode first", play_sounds=True)
+        return True
+
+    if intervention_enabled and intervention_state == INTERVENTION_STATE_POLICY and leader_teach_mode_active(
+        teleop_arm_for_mode_switch
+    ):
+        # The policy cannot drive a leader that is in teach mode; start under the operator.
+        logging.warning("Leader is in teach mode at episode start; starting in intervention (S1).")
+        intervention_state = INTERVENTION_STATE_ACTIVE
+
     if intervention_enabled:
         if intervention_state == INTERVENTION_STATE_ACTIVE:
             # start_in_teleop mode: leader is backdrivable, follower mirrors leader.
@@ -409,6 +428,11 @@ def record_loop(
             log_say("intervene", play_sounds=True)
         pending_end_press_time = None
         logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
+        if callable(getattr(teleop_arm_for_mode_switch, "is_teach_mode_active", None)):
+            logging.info(
+                "Leader holds its pose: press the teach button on the leader arm to drag it. "
+                "Press it again, then the toggle key, to hand control back to the policy."
+            )
 
     def _reset_policy_after_intervention_release() -> None:
         nonlocal cond_policy_runtime_state, uncond_policy_runtime_state
@@ -449,6 +473,8 @@ def record_loop(
             return
         if intervention_state == INTERVENTION_STATE_POLICY:
             _start_intervention()
+            return
+        if teach_mode_blocks_release():
             return
         _release_intervention()
 
@@ -499,6 +525,8 @@ def record_loop(
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         nonlocal rl_phase_started, pending_end_press_time
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+            if teach_mode_blocks_release():
+                return
             intervention_state = INTERVENTION_STATE_RELEASE
             intervention_blend_start_t = None
             intervention_blend_start_action = None
@@ -553,6 +581,8 @@ def record_loop(
     def _release_active_intervention_after_phase_end() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+            return
+        if teach_mode_blocks_release():
             return
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.stop(get_episode_frame_index())

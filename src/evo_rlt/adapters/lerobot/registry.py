@@ -25,6 +25,19 @@ def register() -> None:
     from evo_rlt.adapters.lerobot.policies.configuration_rlt_ac import ChunkACPolicyConfig
     from evo_rlt.adapters.lerobot.policies.configuration_rlt_token import RLTokenPolicyConfig
 
+    # Registers --robot.type=piper / --teleop.type=piper_leader; pyAgxArm loads on connect().
+    import evo_rlt.adapters.lerobot.hardware.piper  # noqa: F401
+    from evo_rlt.adapters.lerobot.fast_init import install_pi05_fast_load
+
+    install_pi05_fast_load()
+
+    # Hub checkpoints saved by newer LeRobot (e.g. lerobot/pi05_base) name this step
+    # `relative_actions_processor`; LeRobot 0.5.1 registers the same class as `delta_actions_processor`.
+    from lerobot.processor.pipeline import ProcessorStepRegistry
+    from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+
+    ProcessorStepRegistry._registry.setdefault("relative_actions_processor", RelativeActionsProcessorStep)
+
     PreTrainedConfig._choice_registry["rlt"] = RLTPretrainedConfig
     PreTrainedConfig._choice_registry["rlt_ac"] = ChunkACPolicyConfig
     PreTrainedConfig._choice_registry["rlt_token"] = RLTokenPolicyConfig
