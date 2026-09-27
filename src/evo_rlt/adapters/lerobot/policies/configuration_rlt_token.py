@@ -35,6 +35,10 @@ class RLTokenPolicyConfig(PreTrainedConfig):
     rl_token_ff_dim: int = 4096
     rl_token_num_rl_tokens: int = 1
     rl_token_init_scale: float = 0.02
+    # "ar" = paper's teacher-forced decoder; "perceiver" = openpi-RLT cross-attention encoder/decoder
+    rl_token_arch: str = "ar"
+    # Prefix tokens the perceiver arch encodes; None = derived from image_only/active_camera_indices/token_pool_size
+    rl_token_seq_len: int | None = None
 
     # --- Prefix token postprocessing (before RL token encoder) ---
     token_pool_size: int = 0

@@ -42,6 +42,7 @@ class RLTDemoDataset(Dataset):
         action_key: str = "action",
         normalize_actions: bool = False,
         tolerance_s: float = 0.04,
+        episodes: list[int] | None = None,
     ):
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -52,6 +53,7 @@ class RLTDemoDataset(Dataset):
         self._dataset = LeRobotDataset(
             repo_id=repo_id,
             root=dataset_path,
+            episodes=episodes,
             revision="main",
             delta_timestamps=delta_timestamps,
             tolerance_s=tolerance_s,
@@ -214,10 +216,12 @@ def make_demo_loader(
     device: str = "cuda",
     tolerance_s: float = 0.04,
     normalize_actions: bool = False,
+    episodes: list[int] | None = None,
 ) -> Iterator[tuple[Observation, torch.Tensor]]:
     """Create an infinite-cycling DataLoader for demo adaptation.
 
-    Yields (Observation, expert_actions) tuples moved to device.
+    Yields (Observation, expert_actions) tuples moved to device. `episodes`
+    restricts the dataset to those episode indices (None = all).
     """
     dataset = RLTDemoDataset(
         dataset_path=dataset_path,
@@ -227,6 +231,7 @@ def make_demo_loader(
         image_size=image_size,
         normalize_actions=normalize_actions,
         tolerance_s=tolerance_s,
+        episodes=episodes,
     )
     loader = DataLoader(
         dataset,

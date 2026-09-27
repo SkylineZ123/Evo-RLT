@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -66,6 +67,8 @@ def test_segment_rlt_argv_marks_key_segment_with_teleop_start_and_rtc():
         vla_rtc_execution_horizon=None,
         vla_ref=True,
         chunk_exec_steps=25,
+        compile_model=False,
+        compile_mode="max-autotune",
     )
     setup = SimpleNamespace(
         followers=[{"port": "left"}, {"port": "right"}],
@@ -465,6 +468,90 @@ def test_full_vla_dry_run_accepts_headless_default_episode_success(tmp_path, cap
     runner.run_full(args)
 
     assert "--default_episode_success=success" in capsys.readouterr().out
+
+
+def _policy_dir(tmp_path, policy_type: str) -> Path:
+    policy_dir = tmp_path / policy_type
+    policy_dir.mkdir()
+    (policy_dir / "config.json").write_text(json.dumps({"type": policy_type}))
+    return policy_dir
+
+
+def test_full_compile_model_adds_pi05_compile_overrides(tmp_path):
+    policy_dir = _policy_dir(tmp_path, "pi05")
+    args = build_parser().parse_args([
+        "full", "--initial-source", "vla", "--policy-path", str(policy_dir), "--compile-model",
+    ])
+
+    assert runner.build_policy_compile_argv(args) == [
+        "--policy.compile_model=true",
+        "--policy.compile_mode=max-autotune",
+    ]
+    args.compile_model = False
+    assert runner.build_policy_compile_argv(args) == []
+
+
+def test_compile_cache_dir_is_set_only_when_compiling(tmp_path, monkeypatch):
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_original")
+    cache_dir = tmp_path / "compile_cache"
+    args = build_parser().parse_args([
+        "full", "--initial-source", "vla", "--policy-path", "/tmp/ac",
+        "--compile-cache-dir", str(cache_dir),
+    ])
+
+    runner.apply_compile_cache_dir(args)
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == "/tmp/torchinductor_original"
+    assert not cache_dir.exists()
+
+    args.compile_model = True
+    runner.apply_compile_cache_dir(args)
+    assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(cache_dir.resolve())
+    assert cache_dir.is_dir()
+
+
+def test_compile_model_rejects_non_pi05_policy(tmp_path):
+    policy_dir = _policy_dir(tmp_path, "rlt_ac")
+    args = build_parser().parse_args([
+        "segment", "--initial-source", "vla", "--critical-source", "rlt",
+        "--policy-path", str(policy_dir), "--compile-model",
+    ])
+
+    with pytest.raises(ValueError, match="supports \\['pi05'\\] policies, got 'rlt_ac'"):
+        runner.build_segment_policy_argv(args)
+
+
+def test_compiled_policy_warmup_runs_before_recording(monkeypatch):
+    import numpy as np
+
+    from evo_rlt.adapters.lerobot.record import backend
+
+    calls = []
+    monkeypatch.setattr(backend, "predict_action", lambda **kwargs: calls.append(kwargs))
+    stateful = SimpleNamespace(reset=lambda: None)
+    policy = SimpleNamespace(config=SimpleNamespace(device="cpu", use_amp=False), reset=stateful.reset)
+    features = {
+        "observation.images.front": {"dtype": "video", "shape": (480, 640, 3)},
+        "observation.state": {"dtype": "float32", "shape": (7,)},
+        "action": {"dtype": "float32", "shape": (7,)},
+    }
+    cfg = SimpleNamespace(
+        policy=SimpleNamespace(compile_model=True, compile_mode="max-autotune"),
+        dataset=SimpleNamespace(single_task="task"),
+    )
+
+    backend._warmup_compiled_policy(cfg, policy, stateful, stateful, features, "piper")
+
+    assert len(calls) == backend.COMPILE_WARMUP_CALLS
+    frame = calls[0]["observation"]
+    assert set(frame) == {"observation.images.front", "observation.state"}
+    assert frame["observation.images.front"].dtype == np.uint8
+    assert frame["observation.images.front"].shape == (480, 640, 3)
+    assert calls[0]["task"] == "task" and calls[0]["robot_type"] == "piper"
+
+    calls.clear()
+    cfg.policy.compile_model = False
+    backend._warmup_compiled_policy(cfg, policy, stateful, stateful, features, "piper")
+    assert calls == []
 
 
 def test_evo_rlt_recording_does_not_import_lerobot_fork_only_modules():

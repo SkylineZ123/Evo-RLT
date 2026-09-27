@@ -18,6 +18,7 @@ import torch
 from safetensors.torch import save_file
 
 from evo_rlt.adapters.lerobot.policies.configuration_rlt import RLTPretrainedConfig
+from evo_rlt.core.rl_token import rl_token_arch_from_state_dict
 from evo_rlt.core.utils import filter_encoder_only
 
 
@@ -35,10 +36,15 @@ def convert(
     out.mkdir(parents=True, exist_ok=True)
 
     merged: OrderedDict[str, torch.Tensor] = OrderedDict()
+    config_overrides = dict(config_overrides or {})
 
     # --- RL Token encoder weights ---
     if rl_token_ckpt:
         ckpt = torch.load(rl_token_ckpt, map_location="cpu", weights_only=True)
+        arch = rl_token_arch_from_state_dict(ckpt["rl_token_state_dict"])
+        config_overrides.setdefault("rl_token_arch", arch["arch"])
+        config_overrides.setdefault("rl_token_seq_len", arch["seq_len"])
+        config_overrides.setdefault("rl_token_num_rl_tokens", arch["num_rl_tokens"])
         enc_keys, skipped = filter_encoder_only(ckpt["rl_token_state_dict"])
         for k, v in enc_keys.items():
             merged[f"rl_token.{k}"] = v
@@ -71,7 +77,7 @@ def convert(
     print(f"Saved {safetensors_path} ({len(merged)} tensors, {total_mb:.1f} MB)")
 
     # --- Save config.json ---
-    cfg = RLTPretrainedConfig(**(config_overrides or {}))
+    cfg = RLTPretrainedConfig(**config_overrides)
     config_path = out / "config.json"
     with open(config_path, "w") as f, draccus.config_type("json"):
         draccus.dump(cfg, f, indent=4)

@@ -28,6 +28,9 @@ class RLTPolicy(nn.Module):
         chunk_dim = config.chunk_length * action_dim
         state_dim = token_dim + config.proprio_dim
 
+        seq_len = config.rl_token.seq_len
+        if config.rl_token.arch == "perceiver" and seq_len is None:
+            seq_len = vla.num_prefix_tokens
         self.rl_token = RLTokenModule(
             token_dim=config.rl_token.token_dim,
             nhead=config.rl_token.nhead,
@@ -36,6 +39,8 @@ class RLTPolicy(nn.Module):
             ff_dim=config.rl_token.ff_dim,
             num_rl_tokens=config.rl_token.num_rl_tokens,
             inference_only=True,
+            arch=config.rl_token.arch,
+            seq_len=seq_len,
         )
 
         self.actor = ChunkActor(

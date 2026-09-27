@@ -149,6 +149,17 @@ class Pi05VLAAdapter(VLAAdapter):
         return self.actual_action_dim
 
     @property
+    def num_prefix_tokens(self) -> int:
+        """Length of prefix_tokens() output; mirrors the slicing/pooling in postprocess_prefix_tokens."""
+        if self._active_camera_indices:
+            n = len(self._active_camera_indices) * self._num_per_camera
+        elif self.image_only:
+            n = self._num_image_tokens
+        else:
+            n = self._num_image_tokens + self.pi05_config.tokenizer_max_length
+        return min(n, self.token_pool_size) if self.token_pool_size > 0 else n
+
+    @property
     def model_device(self) -> torch.device:
         return next(self.pi05.parameters()).device
 

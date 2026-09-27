@@ -14,10 +14,25 @@ class RLTokenConfig:
     dec_layers: int = 4
     ff_dim: int | None = None  # defaults to 4 * token_dim if None
     num_rl_tokens: int = 1  # number of RL tokens (>1 reduces compression ratio)
+    # "ar" = paper's teacher-forced decoder; "perceiver" = openpi-RLT cross-attention encoder/decoder
+    arch: str = "ar"
+    # VLA tokens the perceiver arch encodes; None = take it from the VLA adapter (or the checkpoint)
+    seq_len: int | None = None
 
     def __post_init__(self):
+        from evo_rlt.core.rl_token import RL_TOKEN_ARCHS
+
         if self.ff_dim is None:
             self.ff_dim = 4 * self.token_dim
+        if self.arch not in RL_TOKEN_ARCHS:
+            raise ValueError(f"rl_token.arch must be one of {RL_TOKEN_ARCHS}, got {self.arch!r}")
+
+    def update_from_state_dict(self, state_dict: dict) -> None:
+        """Take arch / seq_len / num_rl_tokens from trained RL token weights (they win over the YAML)."""
+        from evo_rlt.core.rl_token import rl_token_arch_from_state_dict
+
+        for key, value in rl_token_arch_from_state_dict(state_dict).items():
+            setattr(self, key, value)
 
 
 @dataclass

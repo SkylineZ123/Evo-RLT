@@ -98,10 +98,12 @@ def filter_encoder_only(state_dict: dict[str, torch.Tensor]) -> tuple[dict[str, 
         filtered: state_dict with encoder-only keys
         skipped: list of dropped key names
     """
+    from evo_rlt.core.rl_token import DECODER_KEY_PREFIXES
+
     filtered = {}
     skipped = []
     for k, v in state_dict.items():
-        if k.startswith("decoder.") or k.startswith("out_proj."):
+        if k.startswith(DECODER_KEY_PREFIXES):
             skipped.append(k)
         else:
             filtered[k] = v

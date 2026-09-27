@@ -94,6 +94,16 @@ class RLTokenPolicy(PreTrainedPolicy):
         super().__init__(config, *args, **kwargs)
         self.config: RLTokenPolicyConfig = config
 
+        pi05 = self._load_pi05_backbone()
+        # Stash pi0.5 OUTSIDE nn.Module submodule tracking. nn.Module.__setattr__
+        # registers nn.Module values into self._modules; object.__setattr__ stores
+        # in self.__dict__ instead — so state_dict() / get_optim_params() skip it.
+        object.__setattr__(self, "_pi05", pi05)
+        self._num_image_tokens: int = self._compute_num_image_tokens(pi05)
+
+        if config.rl_token_arch == "perceiver" and config.rl_token_seq_len is None:
+            # Persisted through config.json, so a reload builds the same position tables.
+            config.rl_token_seq_len = self._prefix_seq_len()
         self.rl_token = RLTokenModule(
             token_dim=config.rl_token_dim,
             nhead=config.rl_token_nhead,
@@ -102,21 +112,15 @@ class RLTokenPolicy(PreTrainedPolicy):
             ff_dim=config.rl_token_ff_dim,
             num_rl_tokens=config.rl_token_num_rl_tokens,
             inference_only=False,
+            arch=config.rl_token_arch,
+            seq_len=config.rl_token_seq_len,
         )
-
-        pi05 = self._load_pi05_backbone()
-        # Stash pi0.5 OUTSIDE nn.Module submodule tracking. nn.Module.__setattr__
-        # registers nn.Module values into self._modules; object.__setattr__ stores
-        # in self.__dict__ instead — so state_dict() / get_optim_params() skip it.
-        object.__setattr__(self, "_pi05", pi05)
 
         std = _load_norm_stats(config.norm_stats_path)
         if std is not None:
             self.register_buffer("_dim_std", std, persistent=False)
         else:
             self._dim_std = None  # type: ignore[assignment]
-
-        self._num_image_tokens: int = self._compute_num_image_tokens(pi05)
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -145,6 +149,17 @@ class RLTokenPolicy(PreTrainedPolicy):
         tokens_per_camera = (self.config.image_resolution[0] // vision_cfg.patch_size) ** 2
         num_cameras = len(self.config.camera_keys)
         return tokens_per_camera * num_cameras
+
+    def _prefix_seq_len(self) -> int:
+        """Length of the postprocess_prefix_tokens output that forward() feeds the RL token."""
+        cfg = self.config
+        if cfg.active_camera_indices:
+            n = len(cfg.active_camera_indices) * cfg.num_per_camera
+        elif cfg.image_only:
+            n = self._num_image_tokens
+        else:
+            n = self._num_image_tokens + cfg.tokenizer_max_length
+        return min(n, cfg.token_pool_size) if cfg.token_pool_size > 0 else n
 
     # ------------------------------------------------------------------
     # Persistence (cotrained pi0.5 lives outside nn.Module._modules)

@@ -62,7 +62,14 @@ def build_pi05_policy(
 ):
     from evo_rlt.adapters.lerobot.pi05_adapter import Pi05VLAAdapter
     from evo_rlt.core.policy import RLTPolicy
+    from evo_rlt.core.rl_token import load_rl_token_encoder
     import torch
+
+    rl_token_state = None
+    if rl_token_checkpoint is not None:
+        checkpoint = torch.load(rl_token_checkpoint, map_location="cpu", weights_only=False)
+        rl_token_state = checkpoint["rl_token_state_dict"]
+        config.rl_token.update_from_state_dict(rl_token_state)
 
     vla = Pi05VLAAdapter(
         model_path=model_path,
@@ -79,7 +86,6 @@ def build_pi05_policy(
         tokenizer_path=tokenizer_path,
     )
     policy = RLTPolicy(config, vla).to(device)
-    if rl_token_checkpoint is not None:
-        checkpoint = torch.load(rl_token_checkpoint, map_location=device, weights_only=False)
-        policy.rl_token.load_state_dict(checkpoint["rl_token_state_dict"], strict=False)
+    if rl_token_state is not None:
+        load_rl_token_encoder(policy.rl_token, rl_token_state)
     return policy

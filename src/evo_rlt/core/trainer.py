@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 
 import torch
@@ -54,6 +55,42 @@ def _cosine_lr(step: int, warmup: int, total: int, peak_lr: float, min_lr: float
     return min_lr + 0.5 * (peak_lr - min_lr) * (1.0 + math.cos(math.pi * progress))
 
 
+def _format_diagnostics(diag: dict[str, float]) -> str:
+    return " ".join(f"{key}={value:.4f}" for key, value in diag.items())
+
+
+def _append_metrics(save_dir: str | None, record: dict) -> None:
+    """Append one JSON line to save_dir/metrics.jsonl (train diagnostics + val evals)."""
+    import json
+    from pathlib import Path
+
+    if not save_dir:
+        return
+    path = Path(save_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    with open(path / "metrics.jsonl", "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def evaluate_reconstruction(
+    rl_token: RLTokenModule,
+    token_batches: list[torch.Tensor],
+    dim_std: torch.Tensor | None = None,
+    norm_gamma: float = 0.0,
+    device: torch.device | str | None = None,
+) -> dict[str, float]:
+    """Average RLTokenModule.reconstruction_diagnostics over held-out prefix-token batches."""
+    sums: dict[str, float] = {}
+    for tokens in token_batches:
+        diag = rl_token.reconstruction_diagnostics(tokens.to(device), dim_std=dim_std, gamma=norm_gamma)
+        for key, value in diag.items():
+            sums[key] = sums.get(key, 0.0) + value
+    means = {key: value / len(token_batches) for key, value in sums.items()}
+    if "recon_shuffled" in means:
+        means["z_rl_usage"] = 1.0 - means["recon"] / max(means["recon_shuffled"], 1e-12)
+    return means
+
+
 def demo_adaptation(
     algorithm: RLTAlgorithm,
     config: RLTConfig,
@@ -67,6 +104,8 @@ def demo_adaptation(
     metadata: dict | None = None,
     dim_std: torch.Tensor | None = None,
     norm_gamma: float = 0.0,
+    eval_fn: Callable[[RLTokenModule], dict[str, float]] | None = None,
+    eval_every: int = 0,
 ) -> list[float]:
     """Demo adaptation phase: L_ro + alpha * L_vla.
 
@@ -78,6 +117,9 @@ def demo_adaptation(
     Otherwise a new one is built via algorithm.build_rl_token_full().
 
     dim_std + norm_gamma enable per-dim weighted MSE in reconstruction_loss.
+    Every 100 steps the current batch's reconstruction_diagnostics (z_rl_usage,
+    z_rl_cos) are logged; eval_fn (e.g. evaluate_reconstruction on held-out
+    episodes) runs every eval_every steps. Both go to save_dir/metrics.jsonl.
     """
     import gc
 
@@ -109,9 +151,8 @@ def demo_adaptation(
         for pg in demo_optimizer.param_groups:
             pg["lr"] = lr
 
-        loss = rl_token_full.reconstruction_loss(
-            policy.vla.prefix_tokens(obs), dim_std=dim_std, gamma=norm_gamma,
-        )
+        vla_tokens = policy.vla.prefix_tokens(obs)
+        loss = rl_token_full.reconstruction_loss(vla_tokens, dim_std=dim_std, gamma=norm_gamma)
         if alpha > 0:
             loss = loss + alpha * policy.vla.supervised_loss(obs, expert_actions)
 
@@ -131,7 +172,17 @@ def demo_adaptation(
 
         if step % 100 == 0:
             avg_100 = sum(losses[-100:]) / min(len(losses), 100)
-            logger.info("Step %d/%d loss=%.4f avg100=%.4f lr=%.2e", step, total_steps, loss_val, avg_100, lr)
+            diag = rl_token_full.reconstruction_diagnostics(vla_tokens, dim_std=dim_std, gamma=norm_gamma)
+            logger.info(
+                "Step %d/%d loss=%.4f avg100=%.4f lr=%.2e | %s",
+                step, total_steps, loss_val, avg_100, lr, _format_diagnostics(diag),
+            )
+            _append_metrics(save_dir, {"step": step, "split": "train", "loss": loss_val, "lr": lr, **diag})
+
+        if eval_fn is not None and eval_every > 0 and step % eval_every == 0:
+            val = eval_fn(rl_token_full)
+            logger.info("Val step %d | %s", step, _format_diagnostics(val))
+            _append_metrics(save_dir, {"step": step, "split": "val", **val})
 
         # Periodic checkpoint
         if save_dir and step > 0 and step % save_every == 0:
@@ -143,6 +194,11 @@ def demo_adaptation(
             torch.cuda.empty_cache()
 
         step += 1
+
+    if eval_fn is not None and eval_every > 0:
+        val = eval_fn(rl_token_full)
+        logger.info("Val final (step %d) | %s", step, _format_diagnostics(val))
+        _append_metrics(save_dir, {"step": step, "split": "val", **val})
 
     # Sync encoder weights back to the inference-only policy
     algorithm.sync_encoder_from_full(rl_token_full)

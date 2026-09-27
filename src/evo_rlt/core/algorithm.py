@@ -98,12 +98,14 @@ class RLTAlgorithm:
             ff_dim=cfg.ff_dim,
             num_rl_tokens=cfg.num_rl_tokens,
             inference_only=False,
+            arch=cfg.arch,
+            seq_len=self.policy.rl_token.seq_len,
         ).to(device)
         self.sync_full_from_encoder(rl_token_full)
         return rl_token_full
 
     def sync_full_from_encoder(self, rl_token_full: RLTokenModule) -> None:
-        """Copy encoder weights + rl_token_embed from policy.rl_token into a full module."""
+        """Copy encoder weights (incl. the perceiver's context_pos) + rl_token_embed from policy.rl_token."""
         rl_token_full.encoder.load_state_dict(self.policy.rl_token.encoder.state_dict())
         rl_token_full.rl_token_embed.data.copy_(self.policy.rl_token.rl_token_embed.data)
 

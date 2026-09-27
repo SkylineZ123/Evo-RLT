@@ -15,16 +15,21 @@ action_dim: 7             # piper: 6 个关节 + 夹爪
 proprio_dim: 7
 
 rl_token:
+  # perceiver = openpi-RLT 结构：RL token 用 cross-attn 读前缀 token；解码器的 query 只是可学习位置，
+  #             重建只能经过 z_rl（不会绕过 z_rl 抄 teacher token）
+  # ar        = 论文 Eq.2 的 teacher-forcing 自回归解码器（旧 checkpoint 用这个；实测解码器几乎不看 z_rl）
+  arch: perceiver
   token_dim: 2048         # 必须等于 pi0.5 PaliGemma 的 hidden size（2048）
   nhead: 8                # 注意力头数，token_dim 需能被整除
-  enc_layers: 3           # 编码器层数：把 VLA 前缀 token 压缩成 RL token
-  dec_layers: 3           # 解码器层数：只在训练时用于重建，推理不需要
+  enc_layers: 2           # 编码器层数：把 VLA 前缀 token 压缩成 RL token（openpi-RLT 用 2）
+  dec_layers: 2           # 解码器层数：只在训练时用于重建，推理不需要（openpi-RLT 用 2）
   ff_dim: 4096            # Transformer FFN 宽度；null = 4 * token_dim
-  num_rl_tokens: 4        # 可学习 RL token 个数；下游取均值成一个 2048 维向量
+  num_rl_tokens: 1        # 可学习 RL token 个数；下游取均值，所以 >1 时训练/下游不一致，保持 1
+  seq_len: null           # perceiver 编码的前缀 token 数；null = 由 image_only/active_cameras/token_pool_size 推出
 
 demo_adaptation:
   steps: 50000            # 总训练步数（含 warmup）
-  batch_size: 2           # 每步样本数
+  batch_size: 8            # 每步样本数
   lr: 2.0e-4              # 峰值学习率（Adam）
   warmup_steps: 2000      # 线性 warmup 步数，之后余弦衰减到 min_lr
   min_lr: 5.0e-6          # 余弦衰减的终点学习率
@@ -32,7 +37,7 @@ demo_adaptation:
 
 run:
   # ---- 模型 / 数据 ----
-  model_path: /home/boss/zzq/Evo-RLT/output/checkpoint/blood_gas_teleop_0925/020000/pretrained_model   # SFT 后的 pi0.5
+  model_path: /home/boss/zzq/Evo-RLT/output/checkpoint/pi05/blood_gas_teleop_0925/020000/pretrained_model   # SFT 后的 pi0.5
   demo_dataset_path: /home/boss/lerobot_datasets/piper/0925_blood_gas_insertion_20260925/teleop_154125
   task_instruction: null  # null = 用数据集自带的 task（与 SFT 训练时的 prompt 一致）
   camera_name_map:        # 数据集相机 -> pi0.5 相机槽位，必须与 SFT 的 rename_map 一致
@@ -44,14 +49,20 @@ run:
   dtype: bfloat16
 
   # ---- RL token 输入 ----
-  image_only: false       # true = 丢掉语言/状态 token，只用图像 patch token
-  active_cameras: null    # 例如 [front, wrist]；设置后隐含 image_only，只保留这些相机的 token
+  image_only: true       # true = 丢掉语言/状态 token，只用图像 patch token
+  active_cameras: [front, wrist]  # 只保留这些相机的 token（隐含 image_only）；null 会带上 pi0.5 空相机槽的 256 个无效 token
   token_pool_size: 0      # >0 时先把前缀 token 平均池化到这么多个再编码
-  norm_stats: null        # evo-rlt-compute-token-variance 输出的 .pt，用于逐维加权重建损失
-  norm_gamma: 0.0         # 0 = 普通 MSE，0.5 = 部分白化，1 = 完全白化
+  norm_stats: auto        # 逐维 std：auto = 训练前用 norm_stats_batches 个 batch 估计并存到 output_dir/token_stats.pt；也可填 .pt 路径；null = 不用
+  norm_stats_batches: 50
+  norm_gamma: 0.5         # 0 = 普通 MSE，0.5 = 部分白化，1 = 完全白化（pi0.5 前缀里少数几维能量占大头，不加权会主导损失）
+
+  # ---- 验证（留出 episode，日志里的 z_rl_usage ≈ 0 表示解码器没在用 z_rl）----
+  val_episodes: 4         # 按 seed 随机留出的 episode 数；0 = 不做验证
+  val_samples: 64         # 验证帧数（均匀分布在留出 episode 上，前缀 token 只算一次）
+  eval_every: 1000
 
   # ---- 训练 ----
-  output_dir: outputs/rl_token/piper_blood_gas
+  output_dir: /home/boss/zzq/Evo-RLT/output/checkpoint/rl_token/piper_blood_gas_perceiver
   device: cuda
   num_workers: 4
   save_every: 2000

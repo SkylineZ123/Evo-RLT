@@ -94,7 +94,14 @@ def build_live_replay_buffers(policy, args: argparse.Namespace, config) -> tuple
 def create_algorithm_with_cached_transitions(config, rl_token_checkpoint: str | None, device: str):
     from evo_rlt.core.algorithm import RLTAlgorithm
     from evo_rlt.core.policy import RLTPolicy
+    from evo_rlt.core.rl_token import load_rl_token_encoder
     from evo_rlt.core.vla_adapter import DummyVLAAdapter
+
+    rl_token_state = None
+    if rl_token_checkpoint is not None:
+        checkpoint = torch.load(rl_token_checkpoint, map_location="cpu", weights_only=False)
+        rl_token_state = checkpoint["rl_token_state_dict"]
+        config.rl_token.update_from_state_dict(rl_token_state)
 
     vla = DummyVLAAdapter(
         token_dim=config.rl_token.token_dim,
@@ -103,9 +110,8 @@ def create_algorithm_with_cached_transitions(config, rl_token_checkpoint: str | 
         horizon=config.vla_horizon,
     )
     policy = RLTPolicy(config, vla).to(device)
-    if rl_token_checkpoint is not None:
-        checkpoint = torch.load(rl_token_checkpoint, map_location=device, weights_only=False)
-        policy.rl_token.load_state_dict(checkpoint["rl_token_state_dict"], strict=False)
+    if rl_token_state is not None:
+        load_rl_token_encoder(policy.rl_token, rl_token_state)
         logger.info("Loaded RL token checkpoint from %s", rl_token_checkpoint)
 
     policy.freeze_vla()

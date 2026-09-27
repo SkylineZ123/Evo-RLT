@@ -31,6 +31,7 @@ def make_test_algorithm(
     log_every: int = 10,
     eval_every: int = 10,
     save_every: int = 50,
+    rl_token_arch: str = "ar",
 ) -> tuple[RLTAlgorithm, RLTConfig]:
     """Build a small test algorithm + config.
 
@@ -46,6 +47,7 @@ def make_test_algorithm(
     cfg.rl_token.dec_layers = 1
     cfg.rl_token.ff_dim = 128
     cfg.rl_token.num_rl_tokens = 2
+    cfg.rl_token.arch = rl_token_arch
     cfg.actor.hidden_dim = 32
     cfg.actor.num_layers = 1
     cfg.critic.hidden_dim = 32

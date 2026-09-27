@@ -41,6 +41,11 @@ class VLAAdapter(ABC, nn.Module):
         """Per-timestep action dimension."""
         ...
 
+    @property
+    def num_prefix_tokens(self) -> int:
+        """Number of tokens in final_tokens (fixes the size of the perceiver RL token)."""
+        raise NotImplementedError(f"{type(self).__name__} does not report num_prefix_tokens; set rl_token.seq_len")
+
 
 class DummyVLAAdapter(VLAAdapter):
     """Random-output adapter for shape testing and development."""
@@ -77,6 +82,10 @@ class DummyVLAAdapter(VLAAdapter):
     @property
     def token_dim(self) -> int:
         return self._token_dim
+
+    @property
+    def num_prefix_tokens(self) -> int:
+        return self._num_tokens
 
     @property
     def action_dim(self) -> int:

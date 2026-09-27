@@ -19,7 +19,7 @@ from evo_rlt.adapters.lerobot.policies.configuration_rlt import RLTPretrainedCon
 from evo_rlt.core.actor import ChunkActor
 from evo_rlt.core.interfaces import Observation
 from evo_rlt.core.phase_controller import PhaseController
-from evo_rlt.core.rl_token import RLTokenModule
+from evo_rlt.core.rl_token import RLTokenModule, load_rl_token_encoder, rl_token_arch_from_state_dict
 from evo_rlt.core.utils import filter_encoder_only
 from evo_rlt.core.vla_adapter import VLAAdapter
 
@@ -105,6 +105,8 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
             ff_dim=config.rl_token_ff_dim,
             num_rl_tokens=config.rl_token_num_rl_tokens,
             inference_only=True,
+            arch=config.rl_token_arch,
+            seq_len=config.rl_token_seq_len,
         )
 
         # Build Actor (ResidualMLP by default)
@@ -196,6 +198,9 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
             cfg.rl_token_num_rl_tokens = int(meta["num_rl_tokens"])
         elif "rl_token_embed" in sd:
             cfg.rl_token_num_rl_tokens = int(sd["rl_token_embed"].shape[1])
+        arch = rl_token_arch_from_state_dict(sd)
+        cfg.rl_token_arch = arch["arch"]
+        cfg.rl_token_seq_len = arch["seq_len"]
 
         for k, v in sd.items():
             if k.startswith("encoder.") and k.endswith(".linear1.weight"):
@@ -220,7 +225,9 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
             cfg.rl_token_dec_layers = dec_max + 1
 
         log.info(
-            "RL Token arch inferred from ckpt: num_rl_tokens=%d enc=%d dec=%d ff_dim=%d",
+            "RL Token arch inferred from ckpt: arch=%s seq_len=%s num_rl_tokens=%d enc=%d dec=%d ff_dim=%d",
+            cfg.rl_token_arch,
+            cfg.rl_token_seq_len,
             cfg.rl_token_num_rl_tokens,
             cfg.rl_token_enc_layers,
             cfg.rl_token_dec_layers,
@@ -268,7 +275,7 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
         filtered, skipped = filter_encoder_only(raw_sd)
         if skipped:
             log.info("Stripped %d decoder keys from RL Token checkpoint", len(skipped))
-        self.rl_token.load_state_dict(filtered, strict=False)
+        load_rl_token_encoder(self.rl_token, filtered)
 
     def _load_ac_ckpt(self, path: str) -> None:
         log.info("Loading Actor checkpoint from %s", path)

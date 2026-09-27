@@ -47,6 +47,8 @@ class RLTPretrainedConfig(PreTrainedConfig):
     rl_token_dec_layers: int = 3
     rl_token_ff_dim: int = 4096
     rl_token_num_rl_tokens: int = 4
+    rl_token_arch: str = "ar"  # overwritten from the RL token checkpoint when rl_token_ckpt_path is set
+    rl_token_seq_len: int | None = None
 
     # --- Actor architecture ---
     actor_hidden_dim: int = 256
