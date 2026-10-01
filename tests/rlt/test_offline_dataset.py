@@ -99,26 +99,70 @@ def test_build_transitions_basic():
         chunk_length=C,
         stride=1,
     )
-    assert len(transitions) == 2
+    # Full chunks start at t=0,1; t=2,3 have fewer than C frames left and give truncated chunks.
+    assert len(transitions) == 4
+    assert [t.actual_steps.item() for t in transitions] == [3, 3, 2, 1]
 
-    # Transition starting at t=1 should be terminal because next_state is x_{1+C}=x_4.
-    assert transitions[-1].done.item() == 1.0
-    for t in transitions[:-1]:
-        assert t.done.item() == 0.0
+    # Transition starting at t=1 is terminal because next_state is x_{1+C}=x_4; the truncated
+    # tail chunks end the episode too.
+    assert [t.done.item() for t in transitions] == [0.0, 1.0, 1.0, 1.0]
 
     # next_state must be x_{t+C}, not the next sampled anchor.
     assert torch.allclose(transitions[0].next_state_vec, encoded[3][0])
     assert torch.allclose(transitions[1].next_state_vec, encoded[4][0])
 
-    # Sparse binary reward only appears on the terminal chunk, at the final step.
+    # Sparse binary reward only appears on terminal chunks, always on frame 3 (the last executed step).
     assert torch.equal(transitions[0].reward_seq, torch.zeros(C))
     assert torch.equal(transitions[1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.equal(transitions[2].reward_seq, torch.tensor([0.0, 1.0, 0.0]))
+    assert torch.equal(transitions[3].reward_seq, torch.tensor([1.0, 0.0, 0.0]))
 
     # Shapes
     for t in transitions:
         assert t.state_vec.shape == (state_dim,)
         assert t.exec_chunk.shape == (C, action_dim)
-        assert t.actual_steps.item() == C
+
+
+def test_truncated_tail_chunk_holds_last_executed_action():
+    from evo_rlt.adapters.lerobot.offline_dataset import _encoded_to_transitions
+
+    C, action_dim = 4, 2
+    frame_indices = list(range(6))
+    encoded = [(torch.randn(3), torch.randn(C, action_dim), torch.randn(C, action_dim)) for _ in frame_indices]
+    exec_before = encoded[3][2].clone()
+
+    transitions = _encoded_to_transitions(encoded, frame_indices, episode_last_frame=5, chunk_length=C)
+
+    tail = transitions[3]  # starts at t=3: frames 3, 4 are executed
+    assert tail.actual_steps.item() == 2
+    assert torch.equal(tail.exec_chunk[:2], exec_before[:2])
+    assert torch.equal(tail.exec_chunk[2:], exec_before[1].expand(2, action_dim))
+    assert torch.equal(tail.ref_chunk, encoded[3][1])
+    assert torch.equal(encoded[3][2], exec_before)  # the encoded chunk itself is left untouched
+
+
+@pytest.mark.parametrize("episode_len", [37, 38, 120, 121])
+def test_every_bootstrap_chain_ends_in_a_terminal_transition(episode_len):
+    """Each non-terminal next_state must itself start a transition, so the reward reaches every chain."""
+    from evo_rlt.adapters.lerobot.offline_dataset import _encoded_to_transitions, transition_start_frames
+
+    C, stride = 10, 2
+    frame_indices = build_overlap_frame_indices(0, episode_len, C, stride)
+    encoded = [(torch.tensor([float(f)]), torch.zeros(C, 1), torch.zeros(C, 1)) for f in frame_indices]
+
+    transitions = _encoded_to_transitions(encoded, frame_indices, episode_len - 1, C, stride=stride)
+
+    starts = transition_start_frames(frame_indices, episode_len - 1)
+    assert len(starts) == len(transitions)
+    start_states = {t.state_vec.item() for t in transitions}
+    for t in transitions:
+        if t.done.item() == 0.0:
+            assert t.next_state_vec.item() in start_states
+        else:
+            # every terminal chunk rewards the same frame, last - 1
+            reward_step = int(t.reward_seq.argmax())
+            assert t.state_vec.item() + reward_step == episode_len - 2
+            assert reward_step == t.actual_steps.item() - 1
 
 
 def test_build_transitions_stride_uses_c_step_bootstrap():
@@ -142,12 +186,12 @@ def test_build_transitions_stride_uses_c_step_bootstrap():
         stride=stride,
     )
 
-    assert len(transitions) == 3
+    assert len(transitions) == 4
     assert torch.allclose(transitions[0].next_state_vec, encoded[2][0])  # x_{0+4}
     assert torch.allclose(transitions[1].next_state_vec, encoded[3][0])  # x_{2+4}
     assert torch.allclose(transitions[2].next_state_vec, encoded[4][0])  # x_{4+4}
-    assert all(t.actual_steps.item() == C for t in transitions)
-    assert transitions[-1].done.item() == 1.0
+    assert [t.actual_steps.item() for t in transitions] == [C, C, C, 2]  # x_6 is a truncated tail chunk
+    assert [t.done.item() for t in transitions] == [0.0, 0.0, 1.0, 1.0]
 
 
 def test_build_overlap_frame_indices_keeps_terminal_anchor():
@@ -196,8 +240,9 @@ def test_encoded_to_transitions_respects_episode_success_flag():
         stride=1,
         episode_success=True,
     )
-    assert succeeded[-1].done.item() == 1.0
-    assert torch.equal(succeeded[-1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
+    assert succeeded[1].done.item() == 1.0
+    assert torch.equal(succeeded[1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.equal(succeeded[-1].reward_seq, torch.tensor([1.0, 0.0, 0.0]))
 
 
 def test_encoded_to_transitions_accepts_irregular_terminal_anchor():
@@ -221,10 +266,12 @@ def test_encoded_to_transitions_accepts_irregular_terminal_anchor():
         stride=stride,
     )
 
-    assert [frame_indices[i] for i in range(len(frame_indices)) if frame_indices[i] + C <= 13] == [0, 2, 3]
-    assert len(transitions) == 3
-    assert torch.allclose(transitions[-1].next_state_vec, encoded[8][0])  # x_{3+10}=x_13
-    assert transitions[-1].done.item() == 1.0
+    # Full chunks start at 0, 2, 3; the rest are truncated tail chunks.
+    assert len(transitions) == 8
+    assert [t.actual_steps.item() for t in transitions] == [10, 10, 10, 9, 7, 5, 3, 1]
+    assert torch.allclose(transitions[2].next_state_vec, encoded[8][0])  # x_{3+10}=x_13
+    assert [t.done.item() for t in transitions] == [0.0, 0.0] + [1.0] * 6
+    assert torch.allclose(transitions[0].next_state_vec, encoded[6][0])  # x_10, itself a start frame
 
 
 class _DemoBatchDataset(Dataset):
@@ -289,5 +336,7 @@ def test_build_transitions_from_demos_terminal_failure_has_zero_reward():
 
 def test_build_transitions_from_demos_terminal_success_rewards_last_step():
     transitions = _build_demo_transitions_for_episode_success(episode_success=True)
+    assert transitions[1].done.item() == 1.0
+    assert torch.equal(transitions[1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
     assert transitions[-1].done.item() == 1.0
-    assert torch.equal(transitions[-1].reward_seq, torch.tensor([0.0, 0.0, 1.0]))
+    assert torch.equal(transitions[-1].reward_seq, torch.tensor([1.0, 0.0, 0.0]))

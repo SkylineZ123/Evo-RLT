@@ -165,6 +165,9 @@ def test_critic_loss_respects_target_q_clip():
         def forward(self, state_vec, ref_flat):
             return torch.zeros(ref_flat.shape), None
 
+        def clamp_action(self, action_flat):
+            return action_flat
+
     batch = {
         "state_vec": torch.zeros(2, STATE_DIM),
         "exec_chunk_flat": torch.zeros(2, CHUNK_DIM),
@@ -187,3 +190,25 @@ def test_critic_loss_respects_target_q_clip():
 
     assert clipped.item() == pytest.approx(200.0)
     assert unclipped.item() == pytest.approx(2_000_000.0)
+
+
+def test_actor_loss_bc_term_pulls_toward_bc_target_but_conditions_on_ref():
+    B = 3
+    mu = torch.randn(B, CHUNK_DIM)
+    ref, target = torch.randn(B, CHUNK_DIM), torch.randn(B, CHUNK_DIM)
+    seen = {}
+
+    class _StubActor:
+        def forward(self, x, r, training=False):
+            seen["ref"] = r
+            return mu, None
+
+    class _StubCritic:
+        def min_q(self, x, a):
+            return torch.zeros(a.shape[0], 1)
+
+    batch = {"state_vec": torch.randn(B, STATE_DIM), "ref_chunk_flat": ref, "bc_target_flat": target}
+    loss = actor_loss(_StubActor(), _StubCritic(), batch, beta=1.0)
+
+    assert seen["ref"] is ref
+    assert loss.item() == pytest.approx(((mu - target) ** 2).sum(-1).mean().item(), rel=1e-6)

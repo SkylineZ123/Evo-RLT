@@ -7,6 +7,14 @@ For each bucket:
   - rl_rollout:   ref_chunk = exec_chunk only for chunks where the dominant
                   per-frame source is human intervention (chunk-level vote,
                   matching online_collector.py semantics)
+
+--human-label replace_ref (above, the RLT paper's Alg. 1) turns a human chunk into both the actor's input
+and its BC target. --human-label bc_target keeps the pi0.5 ref as the actor input (what deploy feeds it)
+and stores bc_target_chunk instead: the human action on intervened steps, the VLA ref elsewhere
+(openpi-RLT's per-step mask; human_expert treats every step as intervened).
+
+--config PATH.yaml holds the RLTConfig sections plus a `run:` section of defaults
+for the options below (`bucket_mode` == `--bucket-mode`); CLI flags override it.
 """
 from __future__ import annotations
 
@@ -22,12 +30,15 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from evo_rlt.cli.common import configure_logging, load_training_config
+from evo_rlt.cli.common import configure_logging, json_dict, load_training_config, parse_args_with_run_section
 
 logger = configure_logging(__name__)
 
 
-def parse_args() -> argparse.Namespace:
+HUMAN_LABEL_MODES = ("replace_ref", "bc_target")
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo-dataset-path", default=None)
     parser.add_argument("--transition-cache-dir", required=True)
@@ -37,16 +48,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--mark-critical", action="store_true")
+    parser.add_argument(
+        "--human-label",
+        choices=HUMAN_LABEL_MODES,
+        default="replace_ref",
+        help="replace_ref: human chunks become the ref (actor input and BC target); "
+        "bc_target: ref stays the VLA's, the human action is only the BC target (per step).",
+    )
     parser.add_argument("--token-pool-size", type=int, default=64)
     parser.add_argument("--image-only", action="store_true", help="Drop language tokens before RL token encode.")
+    parser.add_argument("--active-cameras", default=None,
+                        help="Comma-separated camera names (e.g. 'front,wrist'). Implies image-only.")
+    parser.add_argument(
+        "--camera-name-map",
+        type=json_dict,
+        default=None,
+        help=(
+            'JSON {dataset camera: pi0.5 slot}, e.g. {"front": "observation.images.base_0_rgb"}; '
+            "default: the bimanual left_wrist/right_wrist/right_front map. Must match RL token training."
+        ),
+    )
+    parser.add_argument("--tokenizer-path", default=None, help="PaliGemma tokenizer repo id or local snapshot path.")
     parser.add_argument("--task-instruction", default="Insert the copper screw into the black sleeve.")
     parser.add_argument("--frame-stride", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers for video decoding.")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--repo-id", default="rlt_demo")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return parse_args_with_run_section(build_parser(), argv)
 
 
 def _collect_intervention_array(dataset) -> torch.Tensor | None:
@@ -69,11 +104,64 @@ def _dominant_is_human(interventions: torch.Tensor, start: int, length: int) -> 
     return human >= (length - human)  # human wins ties, matches online_collector rule
 
 
+def apply_bucket_refs(
+    transitions: list,
+    start_frames: list[int],
+    bucket_mode: str,
+    interventions: torch.Tensor | None,
+    chunk_length: int,
+    human_label: str = "replace_ref",
+) -> int:
+    """Label one episode's human chunks for `bucket_mode`; returns how many chunks are human.
+
+    A chunk is human for human_expert always, for rl_rollout when its executed frames are mostly human.
+    replace_ref: a human chunk's ref becomes its exec_chunk, and each next_ref_chunk then follows the
+    replaced ref of the transition starting at t+C.
+    bc_target: refs stay the VLA's; every transition with a human step gets bc_target_chunk = the executed
+    action on human steps and the ref on the others (and on the padded tail of a truncated chunk).
+    """
+    if human_label not in HUMAN_LABEL_MODES:
+        raise ValueError(f"human_label must be one of {HUMAN_LABEL_MODES}, got {human_label!r}")
+    replaced = [False] * len(transitions)
+    for i, (t, start) in enumerate(zip(transitions, start_frames)):
+        steps = int(t.actual_steps)
+        human_chunk = bucket_mode == "human_expert" or (
+            bucket_mode == "rl_rollout" and _dominant_is_human(interventions, start, steps)
+        )
+        if human_chunk:
+            t.intervention = torch.tensor(1.0)
+            replaced[i] = True
+        if human_label == "replace_ref":
+            if human_chunk:
+                t.ref_chunk = t.exec_chunk.clone()
+            continue
+        mask = torch.zeros(t.ref_chunk.shape[0], dtype=torch.bool)
+        if bucket_mode == "human_expert":
+            mask[:steps] = True
+        elif bucket_mode == "rl_rollout":
+            mask[:steps] = interventions[start : start + steps] > 0.5
+        if mask.any():
+            t.bc_target_chunk = torch.where(mask[:, None], t.exec_chunk, t.ref_chunk)
+    if human_label == "bc_target":
+        return sum(replaced)
+
+    start_to_idx = {start: i for i, start in enumerate(start_frames)}
+    for t, start in zip(transitions, start_frames):
+        nxt = start_to_idx.get(start + chunk_length)
+        if nxt is not None and replaced[nxt]:
+            t.next_ref_chunk = transitions[nxt].ref_chunk.clone()
+    return sum(replaced)
+
+
 def main() -> None:
     args = parse_args()
 
     from evo_rlt.cli.common import build_pi05_policy
-    from evo_rlt.adapters.lerobot.demo_loader import RLTDemoDataset, rlt_demo_collate
+    from evo_rlt.adapters.lerobot.demo_loader import (
+        RLTDemoDataset,
+        load_policy_normalization_stats,
+        rlt_demo_collate,
+    )
     from evo_rlt.adapters.lerobot.offline_dataset import (
         _count_episodes,
         _episode_frame_range,
@@ -81,6 +169,7 @@ def main() -> None:
         build_transitions_from_demos,
         save_transition_cache,
         split_episode_indices,
+        transition_start_frames,
     )
 
     config = load_training_config(args.config)
@@ -98,16 +187,21 @@ def main() -> None:
         dtype=args.dtype,
         rl_token_checkpoint=args.rl_token_checkpoint,
         image_only=args.image_only,
+        active_cameras=[c.strip() for c in args.active_cameras.split(",") if c.strip()] if args.active_cameras else None,
+        tokenizer_path=args.tokenizer_path,
+        camera_name_map=args.camera_name_map,
     )
     policy.freeze_vla()
     policy.freeze_rl_token_encoder()
     policy.eval()
 
+    # The SFT pi0.5's quantiles, not the dataset's: a rollout dataset has its own, narrower ones.
     dataset = RLTDemoDataset(
         dataset_path=args.demo_dataset_path,
         repo_id=args.repo_id,
         chunk_length=config.vla_horizon,
         normalize_actions=True,
+        normalization_stats=load_policy_normalization_stats(args.model_path),
     )
     num_episodes = _count_episodes(dataset)
     splits = split_episode_indices(
@@ -154,7 +248,7 @@ def main() -> None:
                 batch_size=args.batch_size,
                 shuffle=False,
                 collate_fn=rlt_demo_collate,
-                num_workers=0,
+                num_workers=args.num_workers,
                 drop_last=False,
             )
             episode_success = dataset.get_episode_success(episode_id)
@@ -172,53 +266,31 @@ def main() -> None:
                 episode_success=episode_success,
             )
 
-            start_anchors = [
-                f for f in sorted(frame_indices)
-                if f + config.chunk_length <= frame_stop - 1
-            ]
+            start_anchors = transition_start_frames(frame_indices, frame_stop - 1)
             if len(start_anchors) != len(ep_transitions):
                 raise RuntimeError(
                     f"Episode {episode_id}: start_anchors={len(start_anchors)} "
                     f"vs transitions={len(ep_transitions)}"
                 )
 
-            replaced_flags = [False] * len(ep_transitions)
-            for tr_idx, t in enumerate(ep_transitions):
-                n_total += 1
-                if args.bucket_mode == "human_expert":
-                    t.ref_chunk = t.exec_chunk.clone()
-                    t.intervention = torch.tensor(1.0)
-                    replaced_flags[tr_idx] = True
-                    n_ref_replaced += 1
-                elif args.bucket_mode == "rl_rollout":
-                    start_frame = start_anchors[tr_idx]
-                    if _dominant_is_human(interventions, start_frame, config.chunk_length):
-                        t.ref_chunk = t.exec_chunk.clone()
-                        t.intervention = torch.tensor(1.0)
-                        replaced_flags[tr_idx] = True
-                        n_ref_replaced += 1
-
-            # Second pass: propagate next_ref_chunk using the anchor map.
-            anchor_to_idx = {a: i for i, a in enumerate(start_anchors)}
-            for tr_idx, t in enumerate(ep_transitions):
-                next_anchor = start_anchors[tr_idx] + config.chunk_length
-                nxt = anchor_to_idx.get(next_anchor)
-                if nxt is not None and replaced_flags[nxt]:
-                    t.next_ref_chunk = ep_transitions[nxt].ref_chunk.clone()
-
+            n_total += len(ep_transitions)
+            n_ref_replaced += apply_bucket_refs(
+                ep_transitions, start_anchors, args.bucket_mode, interventions, config.chunk_length,
+                human_label=args.human_label,
+            )
             transitions.extend(ep_transitions)
             if ep_index % 20 == 0:
                 logger.info(
-                    "[%s/%s] %d/%d ep, %d transitions, %d ref-replaced",
+                    "[%s/%s] %d/%d ep, %d transitions, %d human chunks",
                     args.bucket_mode, split_name, ep_index, len(episode_ids),
                     len(transitions), n_ref_replaced,
                 )
 
         save_transition_cache(transitions, args.transition_cache_dir, split_name)
         logger.info(
-            "[%s/%s] split done: %d transitions, %d ref-replaced (%.1f%%), %.1fs",
+            "[%s/%s] split done: %d transitions, %d human chunks (%.1f%%, human_label=%s), %.1fs",
             args.bucket_mode, split_name, len(transitions), n_ref_replaced,
-            100.0 * n_ref_replaced / max(n_total, 1),
+            100.0 * n_ref_replaced / max(n_total, 1), args.human_label,
             time.time() - split_start,
         )
 

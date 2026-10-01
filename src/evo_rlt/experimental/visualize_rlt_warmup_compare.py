@@ -320,6 +320,7 @@ def load_rl_policy(paths: RLModelPaths, task: str, device: str):
     ac_ckpt, ac_metadata = load_ac_metadata(paths.ac_ckpt, paths.metrics_path)
     inferred = infer_actor_architecture(ac_ckpt["actor_state_dict"])
 
+    config.actor.arch = str(ac_metadata.get("actor_arch", inferred["arch"]))
     config.actor.hidden_dim = int(ac_metadata.get("actor_hidden", inferred["hidden_dim"]))
     config.actor.num_layers = int(ac_metadata.get("actor_layers", inferred["num_layers"]))
     config.actor.activation = str(ac_metadata.get("actor_activation", inferred["activation"]))

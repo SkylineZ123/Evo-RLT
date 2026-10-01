@@ -2,23 +2,30 @@
 #
 #   evo-rlt-record --config configs/record/piper_segment.yaml
 #
-# 按键：r 开始录关键段；再按 r 结束并标 success，r+r（双击）标 failure
-#       space 人工接管 / 交还（接管期间用主臂示教按钮拖动）
+# 按键：r      进入 RL 并开始录关键段（已在 RL 时再按 r 会被忽略）
+#       s / f  结束当前 episode，标 success / failure 并保存
+#       space  人工接管 / 交还（接管期间用主臂示教按钮拖动）；示教灯还亮着时按 space / r
+#              会排队，按示教键退出后 0.5s 自动执行（示教中再按一次同一个键取消）
+#       ←      丢弃并重录当前 episode      Esc  结束采集
+#       没按 s/f 就结束（→ / 超时）的 episode 没有标签，会被丢弃
 # 典型用途：critical_source: vla 录 VLA 在关键段的基线表现，与 rlt 对比。
 
 command: segment
 
-setup_json: configs/record/piper_setup.json
-task: "Pick up the peg and insert it into the hole."   # ← 与 SFT / cache 构建时一致
+setup_json: /home/boss/zzq/Evo-RLT/configs/record/piper_setup.json
+task: "pick up the blood gas sample and insert it into the sampling needle of blood gas analyzer ."   # ← 与 SFT / cache 构建时一致
 
 initial_source: vla        # 关键段之前由谁控制：vla / teleop
 critical_source: rlt       # 关键段由谁执行：rlt（actor）/ vla
 
-policy_path: outputs/ac/checkpoints/last/pretrained_model
-vla_path: outputs/vla_ft/checkpoints/last/pretrained_model
-rl_token_path: outputs/rl_token/checkpoints/last/pretrained_model
+# policy_path / rl_token_path 必须是 LeRobot 策略目录（含 config.json），不能是 .pt。
+# evo-rlt-train-rl-token / evo-rlt-train-actor-critic 输出的 .pt 先用 evo-rlt-export-lerobot-policy 转换：
+#   <output_dir>/rlt_ac -> policy_path，<output_dir>/rlt_token -> rl_token_path
+policy_path: /home/boss/zzq/Evo-RLT/output/checkpoint/actor_critic/piper_blood_gas_20260930_mix_r3_openpi/lerobot/rlt_ac
+vla_path: /home/boss/zzq/Evo-RLT/output/checkpoint/pi05/blood_gas_teleop_0925/020000/pretrained_model
+rl_token_path: /home/boss/zzq/Evo-RLT/output/checkpoint/actor_critic/piper_blood_gas_20260930_mix_r3_openpi/lerobot/rlt_token
 
-num_episodes: 10
+num_episodes: 150
 episode_time_s: 3000
 reset_time_s: null         # episode 之间的复位时长（秒）；null 用内置默认值
 fps: 30
@@ -26,20 +33,23 @@ dataset_tag: piper_segment
 resume: null               # 接着已有数据集采集：true = 本 dataset_tag 下最近一次有数据的数据集；也可填数据集目录；null = 新建
 vcodec: h264
 
-chunk_exec_steps: 25                   # critical_source: vla 时每个 VLA 动作块执行的步数
-double_tap_window_s: 0.6
-intervention_action_blend_time_s: 0.4  # 人工接管时从策略动作平滑过渡到主臂动作的时长（秒）
+chunk_exec_steps: 25       # critical_source: vla 时每个 VLA 动作块执行的步数
+intervention_action_blend_time_s: 1   # 人工接管时从策略动作平滑过渡到主臂动作的时长（秒）
 vla_ref: true
 preflight: true            # 加载策略前先检查 CAN 通信（被动检查，不会使能机械臂）
 no_teleop: false
 default_episode_success: null
 
-rtc: true
+compile_model: true
+compile_mode: reduce-overhead
+
+rtc: false
 rtc_execution_horizon: 10
 vla_rtc_execution_horizon: null
 rtc_max_guidance_weight: 10.0
 rtc_prefix_attention_schedule: EXP
 rtc_action_queue_size_to_get_new_actions: null
 
+status_view: true          # 相机画面 + 采集状态窗口（VLA/RLT/HUMAN、是否在录、示教状态、成功/失败计数）
 log_level: INFO
 dry_run: false

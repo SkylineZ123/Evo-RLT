@@ -57,6 +57,76 @@ PIPER_CTRL_MODE_LINKAGE_TEACH_INPUT = 0x06
 # In these modes the arm acts as a leader/teaching device and rejects CAN commands.
 PIPER_TEACH_CTRL_MODES = frozenset({PIPER_CTRL_MODE_TEACH, PIPER_CTRL_MODE_LINKAGE_TEACH_INPUT})
 
+# `get_arm_status().msg.teach_status`: pressing the teach button starts a drag (1), pressing
+# it again ends it (2). Ending the drag does NOT take the arm out of ctrl_mode TEACH: the
+# firmware stays there until the host requests CAN control (`set_motion_mode`), so ctrl_mode
+# alone cannot tell "operator is dragging" from "operator let go".
+PIPER_TEACH_STATUS_DRAG = 0x01
+PIPER_TEACH_STATUS_DRAG_ENDED = 0x02
+
+# High-rate feedback nothing here reads: motor state 0x251-0x256 (6 x 100 Hz) and end pose
+# 0x2A2-0x2A4 (3 x 200 Hz), about half of the ~2400 frames/s each Piper broadcasts. pyAgxArm parses
+# every received frame in a Python reader thread, which competes with the policy for the GIL; eager
+# pi0.5 needs the GIL for each of its ~14k kernel launches per chunk. Dropping these frames in the
+# kernel took rlt_ac inference from ~1.1 s to ~0.8 s with both arms, cameras and encoding running.
+PIPER_UNUSED_FEEDBACK_IDS = frozenset((*range(0x251, 0x257), 0x2A2, 0x2A3, 0x2A4))
+_CAN_STD_ID_BITS = 11
+
+
+def piper_rx_filters(drop_ids=PIPER_UNUSED_FEEDBACK_IDS) -> list[dict[str, int]]:
+    """python-can filters that accept every standard (11-bit) CAN ID except ``drop_ids``.
+
+    SocketCAN passes a frame that matches any filter, so the accepted IDs are covered with
+    aligned power-of-two blocks (``id & mask == can_id & mask``) that hold none of the dropped IDs.
+    """
+    drop = frozenset(drop_ids)
+    filters: list[dict[str, int]] = []
+
+    def cover(base: int, bits: int) -> None:
+        size = 1 << bits
+        if not any(base <= can_id < base + size for can_id in drop):
+            filters.append({"can_id": base, "can_mask": ((1 << _CAN_STD_ID_BITS) - 1) & ~(size - 1)})
+        elif bits > 0:
+            cover(base, bits - 1)
+            cover(base + size // 2, bits - 1)
+
+    cover(0, _CAN_STD_ID_BITS)
+    return filters
+
+
+def drop_unused_piper_feedback(arm: Any, channel: str) -> None:
+    """Filter :data:`PIPER_UNUSED_FEEDBACK_IDS` out of ``arm``'s CAN socket, in the kernel.
+
+    Receive-side only: pyAgxArm sends on the same python-can bus, which filters do not affect.
+    The SDK has no public accessor for that bus; if its internals change, the arm keeps working
+    unfiltered and a warning says so.
+    """
+    comm = getattr(getattr(arm, "_ctx", None), "get_comm", lambda: None)()
+    bus = getattr(comm, "recv_bus", None)
+    if bus is None:
+        logger.warning("[%s] pyAgxArm CAN bus not found; unused feedback frames are not filtered.", channel)
+        return
+    bus.set_filters(piper_rx_filters())
+    logger.info(
+        "[%s] CAN receive filter drops unused feedback IDs %s.",
+        channel,
+        ", ".join(f"0x{can_id:03X}" for can_id in sorted(PIPER_UNUSED_FEEDBACK_IDS)),
+    )
+
+
+def piper_teach_engaged(ctrl_mode: int, teach_status: int | None) -> bool:
+    """Whether the operator holds the arm in teach mode (teach button engaged).
+
+    False once the drag has ended (teach_status 2) even though ctrl_mode still reads TEACH:
+    the arm is then waiting for the host to request CAN control. Any other teach_status in
+    ctrl_mode TEACH counts as engaged, so an unknown firmware state keeps the operator in charge.
+    """
+    if ctrl_mode == PIPER_CTRL_MODE_LINKAGE_TEACH_INPUT:
+        return True
+    if ctrl_mode != PIPER_CTRL_MODE_TEACH:
+        return False
+    return teach_status != PIPER_TEACH_STATUS_DRAG_ENDED
+
 # Arm models `pyAgxArm` ships a Piper-series driver for.
 PIPER_ARM_MODELS = ("piper", "piper_h", "piper_l", "piper_x")
 # Driver profiles per firmware range, plus "auto" (LeRobot-side sentinel meaning
@@ -209,11 +279,16 @@ def make_piper_arm(
     with_gripper: bool = True,
     enforce_joint_limits: bool = False,
     firmware_timeout_s: float = 3.0,
+    drop_unused_feedback: bool = True,
 ) -> tuple[Any, Any | None, str]:
     """Build, configure and connect one Piper-series arm.
 
     Returns ``(arm, gripper, firmware_profile)``; ``gripper`` is None when
     ``with_gripper=False``.
+
+    ``drop_unused_feedback`` filters :data:`PIPER_UNUSED_FEEDBACK_IDS` out in the kernel right after
+    connecting, so the SDK's end-pose and motor-state getters return None or a frame caught before
+    the filter went in, never a live value; pass False if you need them.
 
     With ``firmware_version="auto"`` the arm is first opened with the baseline driver
     just to read ``get_firmware()``, then closed and rebuilt on the profile that firmware
@@ -253,6 +328,8 @@ def make_piper_arm(
         gripper = arm.init_effector(arm.OPTIONS.EFFECTOR.AGX_GRIPPER) if with_gripper else None
         arm.set_joint_limits_enabled(bool(enforce_joint_limits))
         arm.connect()
+        if drop_unused_feedback:
+            drop_unused_piper_feedback(arm, channel)
     except Exception:
         arm.disconnect()
         raise
@@ -317,6 +394,17 @@ def read_piper_ctrl_mode(
         if time.monotonic() >= deadline:
             return None
         time.sleep(max(0.005, poll_s))
+
+
+def read_piper_mode_status(arm: Any) -> tuple[int, int | None] | None:
+    """``(ctrl_mode, teach_status)`` from the latest cached status frame, or None if none arrived."""
+    status = arm.get_arm_status()
+    if status is None or float(getattr(status, "timestamp", 0.0) or 0.0) <= 0.0:
+        return None
+    mode = _piper_mode_to_int(getattr(status.msg, "ctrl_mode", None))
+    if mode is None:
+        return None
+    return mode, _piper_mode_to_int(getattr(status.msg, "teach_status", None))
 
 
 def read_piper_status_timestamp(arm: Any) -> float:

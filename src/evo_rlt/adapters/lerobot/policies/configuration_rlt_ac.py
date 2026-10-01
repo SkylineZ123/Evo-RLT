@@ -37,7 +37,8 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     active_camera_indices: list[int] | None = None
     num_per_camera: int = 0
 
-    # --- Actor ---
+    # --- Actor (arch: "mlp" | "openpi", see evo_rlt.core.actor.build_head) ---
+    actor_arch: str = "mlp"
     actor_hidden_dim: int = 256
     actor_num_layers: int = 2
     actor_fixed_std: float = 0.05
@@ -47,6 +48,7 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     actor_residual: bool = False
 
     # --- Critic + target ---
+    critic_arch: str = "mlp"
     critic_hidden_dim: int = 256
     critic_num_layers: int = 2
     critic_activation: str = "relu"
@@ -70,6 +72,11 @@ class ChunkACPolicyConfig(PreTrainedConfig):
     chunk_exec_steps: int = 25
     phase_mode: str = "always_rl"
     deterministic: bool = True
+    # torch.compile the pi0.5 sampler (ChunkACPolicy._compile_vla). The CUDA-graph modes
+    # ("reduce-overhead", "max-autotune") replay its kernels as graphs, so inference stops
+    # waiting on the GIL behind the robot's reader threads. Not supported together with RTC.
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
 
     # --- Observation mapping (for deploy preprocessor) ---
     camera_keys: list[str] = field(default_factory=lambda: list(_DEFAULT_CAMERA_KEYS))

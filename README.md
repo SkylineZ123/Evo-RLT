@@ -310,6 +310,24 @@ python -c 'from evo_rlt.adapters.lerobot import register; register(); from lerob
   --job_name=rlt_ac
 ```
 
+#### Using checkpoints from the native trainers
+
+`evo-rlt-train-rl-token` and `evo-rlt-train-actor-critic` write `.pt` files, while recording needs LeRobot policy directories. Export them first; `--policy-path` is then `<output-dir>/rlt_ac` and `--rl-token-path` is `<output-dir>/rlt_token`:
+
+```bash
+evo-rlt-export-lerobot-policy \
+  --rl-token-checkpoint outputs/rl_token/demo_adapt_checkpoint.pt \
+  --ac-checkpoint outputs/ac/rl_checkpoint.pt \
+  --output-dir outputs/ac/lerobot
+
+# optional: compare the export with the native pipeline on real frames (loads pi0.5, needs a GPU)
+evo-rlt-verify-lerobot-export \
+  --export-dir outputs/ac/lerobot \
+  --rl-token-checkpoint outputs/rl_token/demo_adapt_checkpoint.pt \
+  --ac-checkpoint outputs/ac/rl_checkpoint.pt \
+  --transition-cache-dir outputs/cache
+```
+
 <a id="real-robot-recording-and-deployment"></a>
 
 ## 🤖 Real-Robot Recording and Deployment
@@ -380,26 +398,21 @@ RTC max guidance weight: 10.0
 RTC prefix attention schedule: EXP
 ```
 
-Default collection controls:
+Rollout controls, shared by `collect`, `segment` and `full`:
 
 ```text
-Full-trajectory mode:
-r              save the full episode as success after the double-tap window
-r+r            save the full episode as failure
-space          toggle teleop intervention; pressing again exits teleop
-left arrow     rerecord the current episode
-Esc            stop data collection
-
-Critical-segment mode (`--only-critical`):
-r              enter RLT mode and start recording the critical segment
-r              save the segment as success, exit RLT mode, then end the episode
-r+r            save the segment as failure, exit RLT mode, then end the episode
-space          toggle teleop intervention; pressing again exits teleop
-left arrow     rerecord the current episode
+r              enter RLT mode (`segment` / `--only-critical`: also start recording the critical segment)
+               again: full-trajectory `collect` switches back to VLA; the other modes ignore it
+s              end the episode, label it success and save it
+f              end the episode, label it failure and save it
+space          toggle teleop intervention; pressing again hands control back to the policy
+left arrow     discard and rerecord the current episode
 Esc            stop data collection
 ```
 
-VLA-only full-process recording with pedal outcome labels:
+`full` runs without RLT, so it has no `r`. Only `s` / `f` label an episode: one ended any other way (right arrow, the episode timeout) is discarded, unless `--default-episode-success` supplies a label. Add `--status-view` to open a window with the camera feeds and the rollout state: control source (VLA / RLT / HUMAN), whether frames are being written, the leader's teach mode, a queued handover, and this session's success/failure counts.
+
+VLA-only full-process recording:
 
 ```bash
 evo-rlt-record full \
@@ -409,8 +422,6 @@ evo-rlt-record full \
   --vla-path <BASE_OR_FINETUNED_VLA_PT> \
   --phase-mode always_vla \
   --chunk-exec-steps 25 \
-  --pedal-outcome \
-  --double-tap-window-s 0.6 \
   --num-episodes 5 \
   --episode-time-s 3000 \
   --reset-time-s 0 \
@@ -420,15 +431,8 @@ evo-rlt-record full \
   --no-teleop
 ```
 
-For headless SSH runs where no keyboard or pedal outcome will be provided, add
+For headless SSH runs where no keyboard outcome will be provided, add
 `--default-episode-success success` or `--default-episode-success failure`.
-
-Pedal semantics in this mode:
-
-```text
-single tap    success, end current episode, start next episode
-double tap    failure, end current episode, start next episode
-```
 
 <a id="piper-single-arm"></a>
 
@@ -491,10 +495,10 @@ Saved episodes carry `episode_success=success`, so the same dataset feeds SFT an
 space               enter intervention; the leader stops being commanded and holds its pose
 teach button (on)   the leader becomes draggable; the follower tracks it
 teach button (off)  the leader leaves teach mode
-space               hand control back to the policy
+space (or r)        hand control back to the policy (r also enters RLT)
 ```
 
-`space` is refused while the teach button is still engaged, because the policy cannot drive a leader in teach mode. An episode that starts with teach mode engaged begins in intervention.
+The policy cannot drive a leader in teach mode, so `space` or `r` pressed while the teach button is still engaged is queued: it runs 0.5 s after the button is released, with no second key press. Pressing the same key again while still in teach mode cancels it. `s` / `f` end the episode at any time. An episode that starts with teach mode engaged begins in intervention.
 
 ### Resuming a dataset
 

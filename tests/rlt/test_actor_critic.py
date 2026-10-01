@@ -93,3 +93,57 @@ class TestCritic:
         q.sum().backward()
         for p in twin_critic.parameters():
             assert p.grad is not None
+
+
+class TestOpenpiHead:
+    """arch="openpi": openpi-RLT's per-input LN projections + LN/GELU trunk (core.actor.OpenpiMLP)."""
+
+    Z, P, CHUNK = 64, 7, 70
+
+    def _actor(self):
+        return ChunkActor(state_dim=self.Z + self.P, chunk_dim=self.CHUNK, hidden_dim=32, num_layers=2,
+                          arch="openpi", proprio_dim=self.P)
+
+    def test_shapes_and_gradients(self):
+        actor = self._actor()
+        critic = TwinCritic(state_dim=self.Z + self.P, chunk_dim=self.CHUNK, hidden_dim=32, arch="openpi",
+                            proprio_dim=self.P)
+        state, ref = torch.randn(8, self.Z + self.P), torch.randn(8, self.CHUNK)
+        mu, _ = actor(state, ref)
+        q1, q2 = critic(state, mu)
+        assert mu.shape == (8, self.CHUNK) and q1.shape == q2.shape == (8, 1)
+        (q1.sum() + q2.sum()).backward()
+        assert all(p.grad is not None for p in list(actor.parameters()) + list(critic.parameters()))
+
+    def test_proprio_is_heard_next_to_a_large_z_rl(self):
+        # The proprio stream is layer-normed on its own, so a 100x larger z_rl cannot drown it out.
+        actor = self._actor().eval()
+        state, ref = torch.randn(16, self.Z + self.P), torch.randn(16, self.CHUNK)
+        state[:, :self.Z] *= 100.0
+        moved = state.clone()
+        moved[:, self.Z:] += 0.5
+        with torch.no_grad():
+            delta = (actor(moved, ref)[0] - actor(state, ref)[0]).abs().mean()
+        assert delta > 1e-2
+
+    def test_needs_proprio_dim(self):
+        with pytest.raises(ValueError, match="proprio_dim"):
+            ChunkActor(state_dim=71, chunk_dim=70, arch="openpi")
+
+    def test_config_rejects_unknown_arch(self):
+        from evo_rlt.core.config import ActorConfig, CriticConfig
+
+        with pytest.raises(ValueError, match="actor.arch"):
+            ActorConfig(arch="transformer")
+        with pytest.raises(ValueError, match="critic.arch"):
+            CriticConfig(arch="transformer")
+
+    def test_architecture_is_recovered_from_the_weights(self):
+        from evo_rlt.core.utils import infer_actor_architecture
+
+        inferred = infer_actor_architecture(self._actor().state_dict())
+        shape = (inferred["arch"], inferred["hidden_dim"], inferred["num_layers"], inferred["proprio_dim"])
+        assert shape == ("openpi", 32, 2, self.P)
+        rebuilt = ChunkActor(state_dim=self.Z + self.P, chunk_dim=self.CHUNK,
+                             **{k: v for k, v in inferred.items() if k not in ("fixed_std", "ref_dropout_p")})
+        rebuilt.load_state_dict(self._actor().state_dict())

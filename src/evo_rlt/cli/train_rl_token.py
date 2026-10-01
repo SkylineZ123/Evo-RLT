@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import functools
-import json
 import random
 import sys
 import time
@@ -28,20 +27,19 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from evo_rlt.adapters.lerobot.record.cli import _coerce_config_value, _pop_config_path
-from evo_rlt.cli.common import build_pi05_policy, configure_logging, load_training_config
+from evo_rlt.adapters.lerobot.record.cli import _pop_config_path
+from evo_rlt.cli.common import (
+    apply_run_section,
+    build_pi05_policy,
+    configure_logging,
+    json_dict,
+    load_training_config,
+)
 
 logger = configure_logging(__name__)
 
 DEMO_REPO_ID = "rlt_demo"
 TOKEN_STATS_FILE = "token_stats.pt"
-
-
-def _json_dict(value: str) -> dict[str, str]:
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError(f"expected a JSON object, got {value!r}")
-    return {str(k): str(v) for k, v in parsed.items()}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -73,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated camera names (e.g. 'right_wrist' or 'left_wrist,right_wrist'). Implies image-only and overrides it.")
     parser.add_argument(
         "--camera-name-map",
-        type=_json_dict,
+        type=json_dict,
         default=None,
         help=(
             'JSON {dataset camera: pi0.5 slot}, e.g. {"front": "observation.images.base_0_rgb"}; '
@@ -115,32 +113,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _apply_run_section(parser: argparse.ArgumentParser, run, config_path: str) -> None:
-    """Load the YAML `run:` section as parser defaults; explicit CLI flags still win."""
-    if not isinstance(run, dict):
-        raise SystemExit(f"{config_path}: `run` must be a mapping of option -> value")
-    actions = {action.dest: action for action in parser._actions if action.dest not in ("help", "config")}
-    defaults = {}
-    for raw_key, value in run.items():
-        key = str(raw_key).replace("-", "_")
-        action = actions.get(key)
-        if action is None:
-            raise SystemExit(f"{config_path}: unknown run option '{raw_key}'. Valid options: {sorted(actions)}")
-        if value is None:
-            # `key: null` leaves the built-in default (or the CLI) in charge.
-            continue
-        if key == "camera_name_map":
-            if not isinstance(value, dict):
-                raise SystemExit(f"{config_path}: run.{raw_key} must be a mapping, got {value!r}")
-            defaults[key] = {str(k): str(v) for k, v in value.items()}
-        elif key == "active_cameras" and isinstance(value, list):
-            defaults[key] = ",".join(str(camera) for camera in value)
-        else:
-            defaults[key] = _coerce_config_value(action, raw_key, value)
-        action.required = False
-    parser.set_defaults(**defaults)
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     argv = sys.argv[1:] if argv is None else list(argv)
@@ -155,7 +127,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "keeps pi0.5 frozen and saves only the RL token. Fine-tune the VLA with evo-rlt-train-pi05-sft, "
                 "point run.model_path at that checkpoint and set vla_ft_weight to 0."
             )
-        _apply_run_section(parser, raw.get("run") or {}, config_path)
+        apply_run_section(parser, raw.get("run") or {}, config_path)
     args = parser.parse_args(argv)
     args.config = config_path
     return args
@@ -279,7 +251,9 @@ def _resolve_dim_std(args: argparse.Namespace, vla, demo_loader, prefix: dict) -
 
 
 @torch.no_grad()
-def _build_val_batches(vla, args: argparse.Namespace, episodes: list[int], chunk_length: int, batch_size: int):
+def _build_val_batches(
+    vla, args: argparse.Namespace, episodes: list[int], chunk_length: int, batch_size: int, normalization_stats
+):
     """Prefix tokens of --val-samples frames spread over the held-out episodes, computed once (pi0.5 is frozen)."""
     from evo_rlt.adapters.lerobot.demo_loader import RLTDemoDataset, rlt_demo_collate
 
@@ -289,6 +263,7 @@ def _build_val_batches(vla, args: argparse.Namespace, episodes: list[int], chunk
         chunk_length=chunk_length,
         normalize_actions=args.normalize,
         episodes=episodes,
+        normalization_stats=normalization_stats,
     )
     num_samples = min(args.val_samples, len(dataset))
     indices = np.linspace(0, len(dataset) - 1, num_samples).round().astype(int).tolist()
@@ -305,7 +280,7 @@ def _build_val_batches(vla, args: argparse.Namespace, episodes: list[int], chunk
 def main() -> None:
     args = parse_args()
 
-    from evo_rlt.adapters.lerobot.demo_loader import make_demo_loader
+    from evo_rlt.adapters.lerobot.demo_loader import IMAGE_RESIZE, load_policy_normalization_stats, make_demo_loader
     from evo_rlt.adapters.lerobot.pi05_adapter import DEFAULT_CAMERA_NAME_MAP
     from evo_rlt.core.algorithm import RLTAlgorithm
     from evo_rlt.core.trainer import demo_adaptation, evaluate_reconstruction
@@ -368,6 +343,8 @@ def main() -> None:
         prior_losses = checkpoint.get("losses", [])
         logger.info("Resumed RL token checkpoint at step %d", start_step)
 
+    # pi0.5 reads the normalized state (prompt tokens), so it gets the SFT quantiles, not the dataset's.
+    normalization_stats = load_policy_normalization_stats(args.model_path) if args.normalize else None
     demo_loader = make_demo_loader(
         dataset_path=args.demo_dataset_path,
         batch_size=config.demo_adaptation.batch_size,
@@ -377,6 +354,7 @@ def main() -> None:
         device=args.device,
         normalize_actions=args.normalize,
         episodes=train_episodes,
+        normalization_stats=normalization_stats,
     )
     prefix = {
         "model_path": args.model_path,
@@ -386,13 +364,14 @@ def main() -> None:
         "image_only": args.image_only,
         "active_cameras": active_cameras,
         "token_pool_size": args.token_pool_size,
+        "image_resize": IMAGE_RESIZE,
     }
     dim_std = _resolve_dim_std(args, policy.vla, demo_loader, prefix)
 
     eval_fn = None
     if val_episodes:
         val_batches = _build_val_batches(
-            policy.vla, args, val_episodes, config.vla_horizon, config.demo_adaptation.batch_size
+            policy.vla, args, val_episodes, config.vla_horizon, config.demo_adaptation.batch_size, normalization_stats
         )
         logger.info(
             "Validation on held-out episodes %s: %d frames in %d batches, every %d steps",
@@ -436,6 +415,7 @@ def main() -> None:
             "image_only": args.image_only,
             "active_cameras": active_cameras,
             "token_pool_size": args.token_pool_size,
+            "image_resize": IMAGE_RESIZE,
             "num_rl_tokens": config.rl_token.num_rl_tokens,
             "rl_token": {**dataclasses.asdict(config.rl_token), "seq_len": rl_token_full.seq_len},
             "val_episodes": val_episodes,

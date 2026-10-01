@@ -57,6 +57,13 @@ def add_common_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--dry-run", action="store_true", default=False)
     parser.add_argument(
+        "--status-view",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Open a window with the cameras and the rollout state (control source, recording, "
+        "leader teach mode, session success/failure counts).",
+    )
+    parser.add_argument(
         "--compile-model",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -107,7 +114,6 @@ def add_default_collect_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vcodec", default="h264")
     parser.add_argument("--no-teleop", action="store_true", default=False)
     parser.add_argument("--log-level", default="INFO")
-    parser.add_argument("--double-tap-window-s", type=float, default=0.6)
     parser.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--play-sounds", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rlt-toggle-key", default="r")
@@ -124,13 +130,19 @@ def add_default_collect_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Record only the RLT critical segment. The first RLT key press starts "
-            "recording and enters RLT; the next RLT key press saves the segment. "
-            "The default records the full trajectory immediately and uses the RLT key "
-            "as the full-episode outcome key."
+            "Record only the RLT critical segment: the RLT key enters RLT and starts recording. "
+            "The default records the full trajectory, and the RLT key switches VLA <-> RLT. "
+            "Either way s / f end the episode as success / failure."
         ),
     )
     parser.add_argument("--dry-run", action="store_true", default=False)
+    parser.add_argument(
+        "--status-view",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Open a window with the cameras and the rollout state (control source, recording, "
+        "leader teach mode, session success/failure counts).",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -158,12 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     segment = subparsers.add_parser(
         "segment",
-        help="Record only the key segment. Success/failure labels apply to the segment.",
+        help="Record only the key segment: r starts it, s / f end the episode as success / failure.",
     )
     add_common_record_args(segment)
     add_rtc_args(segment)
     segment.add_argument("--critical-source", choices=["rlt", "vla"], required=True)
-    segment.add_argument("--double-tap-window-s", type=float, default=0.6)
     segment.add_argument("--vla-ref", action=argparse.BooleanOptionalAction, default=True)
     segment.add_argument("--chunk-exec-steps", type=int, default=25)
     segment.add_argument("--intervention-action-blend-time-s", type=float, default=0.4)
@@ -172,15 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     full = subparsers.add_parser(
         "full",
-        help="Record the full trajectory. Success/failure labels apply to the trajectory.",
+        help="Record the full trajectory: s / f end the episode as success / failure.",
     )
     add_common_record_args(full)
     add_rtc_args(full)
     full.add_argument("--phase-mode", default=None)
     full.add_argument("--chunk-exec-steps", type=int, default=None)
-    full.add_argument("--pedal-outcome", action=argparse.BooleanOptionalAction, default=False)
-    full.add_argument("--episode-outcome-key", default="r")
-    full.add_argument("--double-tap-window-s", type=float, default=0.6)
     full.set_defaults(func=run_full)
 
     teleop = subparsers.add_parser(

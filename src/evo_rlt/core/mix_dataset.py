@@ -12,6 +12,7 @@ import torch
 
 from evo_rlt.core.interfaces import (
     ACTUAL_STEPS,
+    BC_TARGET_FLAT,
     DONE,
     EPISODE_ID,
     EXEC_CHUNK_FLAT,
@@ -28,7 +29,7 @@ from evo_rlt.core.replay_buffer import ReplayBuffer
 BATCH_KEYS = (
     STATE_VEC, EXEC_CHUNK_FLAT, REF_CHUNK_FLAT, REWARD_SEQ,
     NEXT_STATE_VEC, NEXT_REF_FLAT, DONE, ACTUAL_STEPS,
-    SOURCE, EPISODE_ID, IS_CRITICAL,
+    SOURCE, EPISODE_ID, IS_CRITICAL, BC_TARGET_FLAT,
 )
 
 

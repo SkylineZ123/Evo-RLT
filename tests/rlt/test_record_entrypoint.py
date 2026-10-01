@@ -10,8 +10,7 @@ import pytest
 from evo_rlt.adapters.lerobot.record.cli import build_parser
 from evo_rlt.adapters.lerobot.record import runner
 from evo_rlt.adapters.lerobot.record.runner import (
-    _collect_external_episode_outcome_key,
-    _patch_double_tap_episode_outcome_listener,
+    _patch_record_key_listener,
     _patch_skip_policyless_reset_loop,
     build_default_collect_record_argv,
     build_segment_record_argv,
@@ -57,7 +56,6 @@ def test_segment_rlt_argv_marks_key_segment_with_teleop_start_and_rtc():
         reset_time_s=None,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         intervention_action_blend_time_s=0.4,
         rtc=True,
         rtc_execution_horizon=10,
@@ -91,12 +89,22 @@ def test_segment_rlt_argv_marks_key_segment_with_teleop_start_and_rtc():
     assert "--rlt.rl_phase_key_toggles_episode=true" in argv
     assert "--rlt.start_in_teleop=true" in argv
     assert "--rlt.rtc_enabled=true" in argv
+    # s / f are the only outcome keys; an episode ended any other way is discarded.
     assert "--enable_episode_outcome_labeling=true" in argv
+    assert "--require_episode_success_label=true" in argv
+    assert not any("double_tap" in arg for arg in argv)
+    assert not any(arg.startswith("--status_view") for arg in argv)
     assert "--policy_sync_to_teleop=true" in argv
     assert "--policy.path=/tmp/ac" in argv
 
+    args.status_view = True
+    args.default_episode_success = "failure"
+    argv = build_segment_record_argv(args, setup, paths, "/tmp/cal", ["--teleop.type=bi_so_leader"])
+    assert "--status_view=true" in argv
+    assert "--default_episode_success=failure" in argv
 
-def test_pedal_listener_routes_record_events_and_episode_outcome(monkeypatch):
+
+def test_pedal_listener_routes_record_events(monkeypatch):
     control_utils = pytest.importorskip("lerobot.utils.control_utils")
     from evo_rlt.adapters.lerobot.record import pedal_listener
 
@@ -119,10 +127,12 @@ def test_pedal_listener_routes_record_events_and_episode_outcome(monkeypatch):
     monkeypatch.setattr(control_utils, "init_keyboard_listener", original_init_keyboard_listener)
     monkeypatch.setattr(pedal_listener, "PedalListener", FakePedalListener)
 
-    _patch_double_tap_episode_outcome_listener(0.01, "e")
+    _patch_record_key_listener()
     listener, events = control_utils.init_keyboard_listener(
         intervention_toggle_key=" ",
         rl_phase_key="r",
+        end_success_key="s",
+        end_failure_key="f",
     )
 
     captured["on_press"]("space")
@@ -131,17 +141,13 @@ def test_pedal_listener_routes_record_events_and_episode_outcome(monkeypatch):
     captured["on_press"]("r")
     assert events["start_rl_phase"] is True
 
-    captured["on_press"]("e")
+    # A single r press never decides the outcome, however long it is left alone.
     time.sleep(0.03)
-    assert events["episode_outcome"] == "success"
-    assert events["exit_early"] is True
+    assert events["episode_outcome"] is None
+    assert events["exit_early"] is False
 
-    events["episode_outcome"] = None
-    events["exit_early"] = False
-    captured["on_press"]("e")
-    captured["on_press"]("e")
-    assert events["episode_outcome"] == "failure"
-    assert events["exit_early"] is True
+    captured["on_press"]("f")
+    assert events["end_phase_failure"] is True
     listener.stop()
 
 
@@ -227,11 +233,11 @@ def test_default_collect_parser_uses_open_source_safe_defaults():
     assert args.rtc_action_queue_size_to_get_new_actions == 30
 
 
-def test_default_collect_full_mode_uses_r_key_as_episode_outcome():
-    parser = build_parser()
-    args = parser.parse_args(["collect", "--policy-path", "/tmp/ac", "--rlt-toggle-key", "r"])
+def test_default_collect_rejects_rlt_key_that_collides_with_outcome_keys():
+    args = build_parser().parse_args(["collect", "--policy-path", "/tmp/ac", "--rlt-toggle-key", "s"])
 
-    assert _collect_external_episode_outcome_key(args) == "r"
+    with pytest.raises(ValueError, match="conflicts"):
+        runner.run_collect(args)
 
 
 def test_default_collect_argv_matches_best_real_robot_rtc_chunks():
@@ -244,7 +250,6 @@ def test_default_collect_argv_matches_best_real_robot_rtc_chunks():
         episode_time_s=3000,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,
@@ -287,7 +292,8 @@ def test_default_collect_argv_matches_best_real_robot_rtc_chunks():
     assert "--rlt.enable=true" in argv
     assert "--rlt.rl_phase_key=r" in argv
     assert "--rlt.start_in_teleop=false" in argv
-    assert "--rlt.rl_phase_key_toggles_critical_phase=true" not in argv
+    # Full trajectory: r switches VLA <-> RLT, s / f end the episode.
+    assert "--rlt.rl_phase_key_toggles_critical_phase=true" in argv
     assert "--rlt.rl_phase_key_toggles_episode=true" not in argv
     assert "--rlt.skip_prefix_recording=true" not in argv
     assert "--rlt.rtc_execution_horizon=10" in argv
@@ -301,7 +307,7 @@ def test_default_collect_argv_matches_best_real_robot_rtc_chunks():
     assert "--vla_ref=true" in argv
 
 
-def test_default_collect_only_critical_starts_recording_on_first_r_and_ends_on_second_r():
+def test_default_collect_only_critical_starts_recording_on_r():
     args = SimpleNamespace(
         policy_path="/tmp/ac",
         vla_path="/tmp/vla.pt",
@@ -311,7 +317,6 @@ def test_default_collect_only_critical_starts_recording_on_first_r_and_ends_on_s
         episode_time_s=3000,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,
@@ -359,7 +364,6 @@ def test_default_collect_start_with_teleop_sets_episode_initial_source():
         episode_time_s=3000,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,
@@ -389,11 +393,11 @@ def test_default_collect_start_with_teleop_sets_episode_initial_source():
     )
 
     assert "--rlt.start_in_teleop=true" in argv
-    assert "--rlt.rl_phase_key_toggles_critical_phase=true" not in argv
+    assert "--rlt.rl_phase_key_toggles_critical_phase=true" in argv
     assert "--rlt.rl_phase_key_toggles_episode=true" not in argv
 
 
-def test_full_vla_pedal_outcome_parser():
+def test_full_vla_parser():
     parser = build_parser()
     args = parser.parse_args([
         "full",
@@ -407,19 +411,28 @@ def test_full_vla_pedal_outcome_parser():
         "always_vla",
         "--chunk-exec-steps",
         "25",
-        "--pedal-outcome",
-        "--episode-outcome-key",
-        "e",
         "--reset-time-s",
         "0",
     ])
 
     assert args.rtc is True
-    assert args.pedal_outcome is True
-    assert args.episode_outcome_key == "e"
     assert args.phase_mode == "always_vla"
     assert args.chunk_exec_steps == 25
     assert args.reset_time_s == 0
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["full", "--initial-source", "vla", "--pedal-outcome"],
+        ["full", "--initial-source", "vla", "--episode-outcome-key", "r"],
+        ["segment", "--initial-source", "vla", "--critical-source", "rlt", "--double-tap-window-s", "0.6"],
+        ["collect", "--policy-path", "/tmp/ac", "--double-tap-window-s", "0.6"],
+    ],
+)
+def test_double_tap_outcome_options_are_gone(argv):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
 
 
 def test_full_vla_dry_run_accepts_headless_default_episode_success(tmp_path, capsys):
@@ -509,15 +522,28 @@ def test_compile_cache_dir_is_set_only_when_compiling(tmp_path, monkeypatch):
     assert cache_dir.is_dir()
 
 
-def test_compile_model_rejects_non_pi05_policy(tmp_path):
-    policy_dir = _policy_dir(tmp_path, "rlt_ac")
+def test_compile_model_rejects_unsupported_policy(tmp_path):
+    policy_dir = _policy_dir(tmp_path, "act")
     args = build_parser().parse_args([
-        "segment", "--initial-source", "vla", "--critical-source", "rlt",
-        "--policy-path", str(policy_dir), "--compile-model",
+        "full", "--initial-source", "vla", "--policy-path", str(policy_dir), "--compile-model",
     ])
 
-    with pytest.raises(ValueError, match="supports \\['pi05'\\] policies, got 'rlt_ac'"):
-        runner.build_segment_policy_argv(args)
+    with pytest.raises(ValueError, match="supports \\['pi05', 'rlt_ac'\\] policies, got 'act'"):
+        runner.build_policy_compile_argv(args)
+
+
+def test_compile_model_rlt_ac_requires_no_rtc(tmp_path):
+    policy_dir = _policy_dir(tmp_path, "rlt_ac")
+    argv = [
+        "segment", "--initial-source", "vla", "--critical-source", "rlt",
+        "--policy-path", str(policy_dir), "--compile-model", "--compile-mode", "reduce-overhead",
+    ]
+
+    with pytest.raises(ValueError, match="requires --no-rtc"):
+        runner.build_segment_policy_argv(build_parser().parse_args(argv))
+
+    overrides = runner.build_segment_policy_argv(build_parser().parse_args([*argv, "--no-rtc"]))
+    assert overrides[-2:] == ["--policy.compile_model=true", "--policy.compile_mode=reduce-overhead"]
 
 
 def test_compiled_policy_warmup_runs_before_recording(monkeypatch):
@@ -647,7 +673,6 @@ def test_default_collect_argv_accepts_headless_default_episode_success():
         episode_time_s=10,
         fps=30,
         vcodec="h264",
-        double_tap_window_s=0.6,
         rtc=True,
         rtc_execution_horizon=10,
         vla_rtc_execution_horizon=25,

@@ -121,6 +121,13 @@ def _encoded_to_transitions(
 ) -> list[ChunkTransition]:
     """Convert list of sampled anchors into chunk-level ChunkTransitions.
 
+    Every sampled frame before the last one starts a transition (see transition_start_frames).
+    A frame with fewer than C frames left gives a truncated terminal chunk: actual_steps =
+    episode_last_frame - t, the success reward on its last executed step (the same frame the full
+    terminal chunk rewards), and the last executed action held over the unexecuted steps. These
+    tail states are the x_{t+C} that the anchors just before the terminal one bootstrap from, so
+    without them those bootstrap chains never reach the reward.
+
     Args:
         stride: Anchor spacing used for overlapping chunk windows. The critic
             still bootstraps from x_{t+C}, so chunk_length must be divisible
@@ -135,32 +142,40 @@ def _encoded_to_transitions(
 
     frame_to_encoded_idx = {frame_idx: idx for idx, frame_idx in enumerate(frame_indices)}
     transitions: list[ChunkTransition] = []
-    for idx, start_frame in enumerate(frame_indices):
-        next_frame = start_frame + chunk_length
-        if next_frame > episode_last_frame:
-            continue
-
-        next_idx = frame_to_encoded_idx.get(next_frame)
-        if next_idx is None:
-            raise ValueError(
-                f"Missing next_state anchor for frame {start_frame} -> {next_frame}; "
-                f"sampled anchors must include every t+C state"
-            )
-
+    for start_frame in transition_start_frames(frame_indices, episode_last_frame):
+        idx = frame_to_encoded_idx[start_frame]
         s, r, e = encoded[idx]
+        next_frame = start_frame + chunk_length
+        if next_frame <= episode_last_frame:
+            steps = chunk_length
+            is_terminal = next_frame == episode_last_frame
+            next_idx = frame_to_encoded_idx.get(next_frame)
+            if next_idx is None:
+                raise ValueError(
+                    f"Missing next_state anchor for frame {start_frame} -> {next_frame}; "
+                    f"sampled anchors must include every t+C state"
+                )
+        else:
+            steps = episode_last_frame - start_frame
+            is_terminal = True
+            e = e.clone()
+            e[steps:] = e[steps - 1]
+            # done=1 masks the bootstrap; x_last is just a well-defined placeholder.
+            next_idx = frame_to_encoded_idx.get(episode_last_frame, idx)
+
         ns, nr = encoded[next_idx][0], encoded[next_idx][1]
-        is_terminal = next_frame == episode_last_frame
         rew = build_reward_seq(
             chunk_length=chunk_length,
             is_terminal_chunk=is_terminal,
             episode_success=episode_success,
+            actual_steps=steps,
         )
         transitions.append(ChunkTransition(
             state_vec=s, exec_chunk=e, ref_chunk=r, reward_seq=rew,
             next_state_vec=ns, next_ref_chunk=nr,
             done=torch.tensor(float(is_terminal)),
             intervention=torch.tensor(0.0),
-            actual_steps=torch.tensor(chunk_length),
+            actual_steps=torch.tensor(steps),
             source=torch.tensor(source),
             episode_id=torch.tensor(episode_id),
             is_critical=torch.tensor(is_critical),
@@ -171,6 +186,11 @@ def _encoded_to_transitions(
             f"stride={stride} and chunk_length={chunk_length}"
         )
     return transitions
+
+
+def transition_start_frames(frame_indices: list[int], episode_last_frame: int) -> list[int]:
+    """Start frame of each transition _encoded_to_transitions builds, in the same order."""
+    return [frame for frame in frame_indices if frame < episode_last_frame]
 
 
 def build_overlap_frame_indices(
@@ -218,6 +238,7 @@ def build_transition_replay_buffer(
     split: str = "train",
     device: str = "cpu",
     episode_ids: list[int] | None = None,
+    normalization_stats=None,
 ) -> ReplayBuffer:
     """Build a replay buffer from a raw demo dataset.
 
@@ -230,11 +251,13 @@ def build_transition_replay_buffer(
         split: Which split to use ("train", "val", "test").
         device: Device for VLA forward passes.
         episode_ids: Override episode ids; if None, auto-split by config.seed.
+        normalization_stats: The policy normalizer's stats (see load_policy_normalization_stats);
+            None normalizes with the dataset's own meta.stats.
     """
     off_cfg = config.offline_rl
     dataset = RLTDemoDataset(
         dataset_path=demo_dataset_path, chunk_length=config.vla_horizon,
-        normalize_actions=True,
+        normalize_actions=True, normalization_stats=normalization_stats,
     )
 
     if episode_ids is None:
@@ -306,6 +329,8 @@ def save_transition_cache(
             "source": t.source,
             "episode_id": t.episode_id,
             "is_critical": t.is_critical,
+            # only written when set, so caches without it keep the old format
+            **({"bc_target_chunk": t.bc_target_chunk} if t.bc_target_chunk is not None else {}),
         }
         for t in transitions
     ]

@@ -168,7 +168,7 @@ class RLTActionModifier(nn.Module):
 
         Returns:
             VLA phase:  (B, chunk_exec_steps, action_dim)
-            RL phase:   (B, chunk_length, action_dim) in [-1, 1].
+            RL phase:   (B, chunk_length, action_dim) within the actor's action bounds.
         """
         phase_val = 1.0 if self.is_rl_phase else 0.0
         source_val = phase_val
@@ -185,17 +185,22 @@ class RLTActionModifier(nn.Module):
         state_vec = torch.cat([z_rl, proprio], dim=-1)
         ref_flat = flatten_chunk(ref_chunk)
         if not self.vla_ref:
-            # Hide the VLA reference from the actor: training ref-dropout
-            # multiplies ref_chunk_flat by a 0/1 mask, so a dropped sample
-            # is exactly an all-zero ref. Reproduce that here.
             ref_flat = torch.zeros_like(ref_flat)
         should_log = self._cc_log_count < 3 or self._cc_log_count % 30 == 0
         mu, _ = self.actor(state_vec, ref_flat, training=False)
-        chunk = unflatten_chunk(mu, self.chunk_length).clamp(-1, 1)
+        # Per-dim bounds saved with the actor (the range the critic was trained on); a fixed [-1, 1]
+        # would cut the many real actions outside the per-episode-averaged q01/q99.
+        clamped = self.actor.clamp_action(mu)
+        chunk = unflatten_chunk(clamped, self.chunk_length)
+        if self._cc_log_count == 0:
+            print(
+                f"[RLT] RL-phase action bounds "
+                f"low={[round(v, 3) for v in self.actor.action_low[:self.action_dim].tolist()]} "
+                f"high={[round(v, 3) for v in self.actor.action_high[:self.action_dim].tolist()]}",
+                flush=True,
+            )
         if should_log:
             delta = (chunk - ref_chunk).abs()
-            # Diagnostic: the VLA ref is only the actor input; the returned
-            # chunk below is the RLT actor output that will be executed.
             print(
                 f"[RLT source=RLT_ACTOR vla_ref={self.vla_ref}] "
                 f"compute_chunk #{self._cc_log_count}: "
@@ -203,6 +208,7 @@ class RLTActionModifier(nn.Module):
                 f"actor_out[0,0,:4]={[round(v, 4) for v in chunk[0, 0, :4].tolist()]}, "
                 f"mean_abs_delta={delta.mean().item():.4f}, "
                 f"max_abs_delta={delta.max().item():.4f}, "
+                f"clipped_frac={(clamped != mu).float().mean().item():.4f}, "
                 f"ref-into-actor abs-sum={ref_flat.abs().sum().item():.4f}",
                 flush=True,
             )

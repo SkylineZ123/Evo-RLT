@@ -123,6 +123,8 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
             activation=config.actor_activation,
             layer_norm=config.actor_layer_norm,
             residual=config.actor_residual,
+            arch=config.actor_arch,
+            proprio_dim=config.proprio_dim,
         )
 
         # Phase controller
@@ -246,11 +248,12 @@ class RLTPretrainedPolicy(PreTrainedPolicy):
         cfg = self.config
         if not meta:
             return
-        for key in ("hidden_dim", "num_layers", "residual", "activation", "layer_norm"):
+        for key in ("arch", "hidden_dim", "num_layers", "residual", "activation", "layer_norm"):
             if key in meta:
                 setattr(cfg, f"actor_{key}", meta[key])
         log.info(
-            "Actor arch inferred from ckpt: hidden=%d layers=%d residual=%s act=%s ln=%s",
+            "Actor arch inferred from ckpt: arch=%s hidden=%d layers=%d residual=%s act=%s ln=%s",
+            cfg.actor_arch,
             cfg.actor_hidden_dim,
             cfg.actor_num_layers,
             cfg.actor_residual,

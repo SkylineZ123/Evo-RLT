@@ -418,11 +418,11 @@ def _run_hil_loop(monkeypatch, leader, toggles):
     return states
 
 
-def test_release_is_refused_while_leader_teach_button_is_engaged(monkeypatch):
+def test_release_waits_while_leader_teach_button_is_engaged(monkeypatch):
     leader = _make_hil_leader_class()(_pose(0.2))
     # A toggle pressed on tick N takes effect on tick N+1.
-    # tick 1: space -> S1. tick 3: operator in teach mode presses space -> refused, stays S1.
-    # tick 5: teach button released, space -> back to the policy.
+    # tick 1: space -> S1. tick 3: operator in teach mode presses space -> queued, stays S1.
+    # tick 5: teach button released, space again -> back to the policy at once.
     states = _run_hil_loop(monkeypatch, leader, {1: (False, True), 3: (True, True), 5: (False, True)})
 
     assert states == ["policy", "policy", "human", "human", "human", "human", "policy", "policy"]
@@ -435,3 +435,350 @@ def test_episode_starts_under_operator_when_teach_button_already_engaged(monkeyp
 
     assert states == ["human", "human", "human", "policy", "policy"]
     assert leader.calls == ["manual=True", "manual=False"]
+
+
+# --------------------------------------------------------------------------- rollout keys
+
+# Operator keys as the listener delivers them to the recording loop.
+_KEY_EVENTS = {
+    "space": "toggle_intervention",
+    "r": "start_rl_phase",
+    "s": "end_phase_success",
+    "f": "end_phase_failure",
+}
+
+
+class FakeRLTPolicy:
+    """Duck-typed RLT policy: `set_rl_mode` makes record_loop treat it as one."""
+
+    def __init__(self):
+        self.config = SimpleNamespace(device="cpu", use_amp=False)
+        self.mode = "vla"
+        self.calls = []
+
+    def reset(self):
+        self.mode = "vla"
+
+    def set_rl_mode(self):
+        self.calls.append("rl")
+        self.mode = "rl"
+
+    def set_vla_mode(self):
+        self.calls.append("vla")
+        self.mode = "vla"
+
+    def interrupt_chunk(self):
+        pass
+
+    def pop_step_metadata(self):
+        from evo_rlt.adapters.lerobot.record.annotations import (
+            PHASE_CRITICAL,
+            PHASE_PREFIX,
+            SOURCE_RL,
+            SOURCE_VLA,
+        )
+
+        rl = self.mode == "rl"
+        return SimpleNamespace(
+            phase=PHASE_CRITICAL if rl else PHASE_PREFIX, source_type=SOURCE_RL if rl else SOURCE_VLA
+        )
+
+
+def _run_scripted_hil_loop(monkeypatch, leader, script, *, policy=None, max_ticks=30, **loop_kwargs):
+    """Run record_loop; `script` maps tick -> {"teach": bool, "keys": [...]}.
+
+    Keys pressed during tick N are handled at the start of tick N+1, as with a real listener.
+    Returns the per-tick control source, the events dict and the dataset.
+    """
+    from evo_rlt.adapters.lerobot.record import loop
+
+    policy_pose = _pose(0.9)
+    monkeypatch.setattr(loop, "_predict_policy_action_with_acp_inference", lambda **_kw: "policy")
+    monkeypatch.setattr(loop, "make_robot_action", lambda _action, _features: dict(policy_pose))
+    monkeypatch.setattr(loop, "_validate_policy_image_features", lambda *_a: None)
+    monkeypatch.setattr(loop, "log_say", lambda *_a, **_kw: None)
+
+    events = {"exit_early": False, **dict.fromkeys(_KEY_EVENTS.values(), False)}
+    states = []
+
+    class Follower(FakeFollower):
+        robot_type = "piper"
+        name = "piper"
+        action_features = dict.fromkeys(JOINTS, float)
+
+        def __init__(self):
+            super().__init__(_pose(0.0))
+            self.tick = 0
+
+        def get_observation(self):
+            step = script.get(self.tick, {})
+            if "teach" in step:
+                leader.teach = step["teach"]
+            for key in step.get("keys", ()):
+                events[_KEY_EVENTS[key]] = True
+            if self.tick >= max_ticks:
+                events["exit_early"] = True
+            self.tick += 1
+            return super().get_observation()
+
+        def send_action(self, action):
+            states.append("policy" if action == policy_pose else "human")
+            return super().send_action(action)
+
+    reset = SimpleNamespace(reset=lambda: None)
+    dataset = HILDataset()
+    loop.record_loop(
+        robot=Follower(),
+        events=events,
+        fps=1000,
+        teleop_action_processor=_identity,
+        robot_action_processor=_identity,
+        robot_observation_processor=_identity,
+        dataset=dataset,
+        teleop=leader,
+        policy=policy if policy is not None else FakeRLTPolicy(),
+        preprocessor=reset,
+        postprocessor=reset,
+        control_time_s=60,
+        single_task="insert",
+        **loop_kwargs,
+    )
+    return states, events, dataset
+
+
+def test_release_runs_by_itself_once_the_teach_button_is_released(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    # tick 3: space in teach mode -> queued. tick 5: button released, no key -> handed back.
+    states, _, _ = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        {1: {"keys": ["space"]}, 3: {"teach": True, "keys": ["space"]}, 5: {"teach": False}},
+        max_ticks=7,
+        teach_release_grace_s=0.0,
+    )
+
+    assert states == ["policy", "policy", "human", "human", "human", "human", "policy", "policy"]
+    assert leader.calls == ["manual=False", "manual=True", "manual=False"]
+
+
+def test_queued_release_waits_for_the_grace_period(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    states, _, _ = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        {1: {"keys": ["space"]}, 3: {"teach": True, "keys": ["space"]}, 5: {"teach": False}},
+        max_ticks=7,
+        teach_release_grace_s=60.0,
+    )
+
+    assert states[2:] == ["human"] * 6
+
+
+def test_pressing_again_in_teach_mode_cancels_the_queued_release(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    script = {
+        1: {"keys": ["space"]},
+        3: {"teach": True, "keys": ["space"]},  # queued
+        4: {"keys": ["space"]},  # still in teach mode -> cancelled
+        6: {"teach": False},
+    }
+    states, _, _ = _run_scripted_hil_loop(monkeypatch, leader, script, max_ticks=8, teach_release_grace_s=0.0)
+
+    assert states == ["policy", "policy"] + ["human"] * 7
+
+
+def test_segment_r_starts_recording_and_s_ends_the_episode_as_success(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    policy = FakeRLTPolicy()
+    # tick 1: r -> RL from tick 2. tick 3: r again is ignored. tick 5: s -> episode ends after tick 6.
+    states, events, dataset = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        {1: {"keys": ["r"]}, 3: {"keys": ["r"]}, 5: {"keys": ["s"]}},
+        policy=policy,
+        skip_prefix_recording=True,
+        rl_phase_key_toggles_episode=True,
+    )
+
+    assert events["episode_outcome"] == "success"
+    assert len(states) == 7
+    # Only the RL segment is written: ticks 2..6.
+    assert len(dataset.buffer) == 5
+    assert policy.calls == ["rl", "vla"]
+
+
+def test_collect_r_switches_back_to_vla_and_f_ends_the_episode_as_failure(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    policy = FakeRLTPolicy()
+    states, events, dataset = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        {1: {"keys": ["r"]}, 3: {"keys": ["r"]}, 5: {"keys": ["f"]}},
+        policy=policy,
+        rl_phase_key_toggles_critical_phase=True,
+    )
+
+    assert events["episode_outcome"] == "failure"
+    # The whole trajectory is written, VLA and RL alike.
+    assert len(dataset.buffer) == len(states) == 7
+    phases = [float(frame["complementary_info.phase"][0]) for frame in dataset.buffer]
+    assert phases == [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+    assert policy.calls == ["rl", "vla", "vla"]
+
+
+def test_r_during_teach_mode_intervention_starts_rl_after_the_button_is_released(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    policy = FakeRLTPolicy()
+    script = {
+        1: {"keys": ["space"]},  # S1 from tick 2
+        2: {"teach": True},
+        3: {"keys": ["r"]},  # queued: the leader is in teach mode
+        5: {"teach": False},  # released -> RL starts on tick 6
+        8: {"keys": ["s"]},
+    }
+    states, events, dataset = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        script,
+        policy=policy,
+        skip_prefix_recording=True,
+        rl_phase_key_toggles_episode=True,
+        teach_release_grace_s=0.0,
+    )
+
+    assert states == ["policy", "policy", "human", "human", "human", "human", "policy", "policy", "policy", "policy"]
+    assert policy.calls == ["rl", "vla"]
+    assert leader.calls == ["manual=False", "manual=True", "manual=False"]
+    # Recording starts with the RL phase on tick 6.
+    assert len(dataset.buffer) == 4
+    assert events["episode_outcome"] == "success"
+
+
+def test_s_ends_the_episode_even_while_the_leader_is_in_teach_mode(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+    states, events, _ = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        {1: {"keys": ["space"]}, 2: {"teach": True}, 3: {"keys": ["r"]}, 4: {"keys": ["f"]}},
+        rl_phase_key_toggles_episode=True,
+        teach_release_grace_s=0.0,
+    )
+
+    assert events["episode_outcome"] == "failure"
+    assert states == ["policy", "policy", "human", "human", "human", "human"]
+
+
+# --------------------------------------------------------------------------- status window
+
+
+def test_rollout_status_describes_control_source_teach_mode_and_queue():
+    from evo_rlt.adapters.lerobot.record.rollout_status import (
+        CONTROL_HUMAN,
+        CONTROL_RLT,
+        HANDOVER_RL_START,
+        RolloutStatus,
+        build_rollout_status,
+    )
+
+    status = build_rollout_status(
+        RolloutStatus(
+            task="insert",
+            control=CONTROL_HUMAN,
+            critical=False,
+            recording=False,
+            step=0,
+            elapsed_s=3.0,
+            fps=29.5,
+            episode_index=4,
+            teach_mode=True,
+            queued=HANDOVER_RL_START,
+            queued_key="r",
+            waiting_for_rl=True,
+            saved_episodes=4,
+            saved_frames=900,
+            successes=3,
+            failures=1,
+            last_outcome="failure",
+        )
+    )
+    text = [line[0] for line in status["lines"]]
+    assert text[0] == "CONTROL: HUMAN"
+    assert "LEADER TEACH MODE: ON" in text
+    assert any(line.startswith("QUEUED: RL start") and "r again cancels" in line for line in text)
+    assert "this session: 3 success | 1 failure | last: failure" in text
+    assert (status["recording"], status["saved_episodes"], status["episode_index"]) == (False, 4, 4)
+
+    rl = build_rollout_status(
+        RolloutStatus(
+            task="insert", control=CONTROL_RLT, critical=True, recording=True, step=12,
+            elapsed_s=1.0, fps=None, episode_index=0,
+        )
+    )
+    assert rl["lines"][0] == ("CONTROL: RLT (critical segment)", "green", 0.9)
+    # No teach button, nothing queued: no teach / queue rows.
+    assert not any("TEACH" in line[0].upper() or "QUEUED" in line[0] for line in rl["lines"])
+
+
+def test_rollout_controls_help_omits_unbound_keys():
+    from evo_rlt.adapters.lerobot.record.rollout_status import rollout_controls_help
+
+    assert rollout_controls_help().startswith("r=start RL, s=success, f=failure, space=")
+    assert rollout_controls_help(None, None) == "s=success, f=failure, <-=re-record, Esc=stop"
+
+
+def test_status_view_draws_extra_lines():
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    from evo_rlt.adapters.lerobot.record.status_view import StatusView
+
+    view = StatusView(panel_height=380)
+    view._cv2 = cv2
+    canvas = view._render(
+        {"front": np.zeros((48, 64, 3), dtype=np.uint8)},
+        {"task": "insert", "recording": True, "lines": [("CONTROL: RLT", "green", 0.9), ("keys", "grey", 0.45)]},
+    )
+    assert canvas.shape[0] == 360 + 380
+    panel = canvas[360:]
+    # Green text was drawn somewhere below the REC row.
+    assert (panel[80:, :, 1] > 150).any()
+
+
+def test_record_loop_publishes_rollout_status_every_tick(monkeypatch):
+    leader = _make_hil_leader_class()(_pose(0.2))
+
+    class RecordingView:
+        def __init__(self):
+            self.statuses = []
+            self.renders = 0
+
+        def update(self, images, status):
+            self.statuses.append(status)
+
+        def render_once(self, on_key=None):
+            # The window must not forward keys: the global listener already delivers them.
+            on_key("s")
+            self.renders += 1
+            return True
+
+    view = RecordingView()
+    session = {"episode_index": 7, "saved_episodes": 7, "saved_frames": 99, "successes": 2, "failures": 0}
+    states, events, _ = _run_scripted_hil_loop(
+        monkeypatch,
+        leader,
+        {1: {"keys": ["space"]}, 2: {"teach": True}, 3: {"keys": ["r"]}, 5: {"keys": ["s"]}},
+        skip_prefix_recording=True,
+        rl_phase_key_toggles_episode=True,
+        status_view=view,
+        status_session=session,
+    )
+
+    assert view.renders == len(states) == len(view.statuses)
+    controls = [status["lines"][0][0] for status in view.statuses]
+    assert controls[:2] == ["CONTROL: VLA"] * 2 and controls[2] == "CONTROL: HUMAN"
+    texts = [line[0] for line in view.statuses[4]["lines"]]
+    assert "LEADER TEACH MODE: ON" in texts
+    assert any(text.startswith("QUEUED: RL start") for text in texts)
+    assert "not recording yet - press r to start the RL segment" in texts
+    assert view.statuses[-1]["episode_index"] == 7 and view.statuses[-1]["saved_frames"] == 99
+    assert events["episode_outcome"] == "success"

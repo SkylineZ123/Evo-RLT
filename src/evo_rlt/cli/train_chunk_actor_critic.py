@@ -12,19 +12,39 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from evo_rlt.cli.common import build_pi05_policy, configure_logging, load_training_config
+from evo_rlt.cli.common import (
+    build_pi05_policy,
+    configure_logging,
+    load_training_config,
+    parse_args_with_run_section,
+)
 
 logger = configure_logging(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train chunk-level actor-critic from a transition cache or raw demo dataset.")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train chunk-level actor-critic from a transition cache or raw demo dataset. --config PATH.yaml holds "
+            "the RLTConfig sections plus a `run:` section of defaults for the options below; CLI flags override it."
+        )
+    )
     parser.add_argument("--model-path", default="lerobot/pi05_base")
-    parser.add_argument("--transition-cache-dir", default=None, help="Directory containing chunk-transition cache files.")
+    parser.add_argument(
+        "--transition-cache-dir", nargs="+", default=None,
+        help="One or more chunk-transition cache directories (e.g. a warmup_vla bucket and rl_rollout buckets).",
+    )
+    parser.add_argument(
+        "--cache-mix-weights", nargs="+", type=float, default=None,
+        help=(
+            "Sampling weight per --transition-cache-dir (normalized): every batch takes that share of its "
+            "transitions from each cache. Default: each cache's share of all train transitions."
+        ),
+    )
     parser.add_argument("--demo-dataset-path", default=None, help="Raw demo dataset path. Required when no transition cache is provided.")
     parser.add_argument("--config", default=None, help="Path to an RLT YAML config")
     parser.add_argument("--output-dir", default="outputs/rlt_actor_critic")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--rl-token-checkpoint", default=None, help="RL token checkpoint to initialize the policy encoder.")
     parser.add_argument("--gradient-steps", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
@@ -39,7 +59,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-instruction", default="pick up the object")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     parser.add_argument("--tokenizer-path", default=None, help="PaliGemma tokenizer repo id or local snapshot path.")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return parse_args_with_run_section(build_parser(), argv)
 
 
 def apply_overrides(config, args: argparse.Namespace) -> None:
@@ -61,17 +85,62 @@ def apply_overrides(config, args: argparse.Namespace) -> None:
         config.critic.lr = args.critic_lr
 
 
-def load_cached_replay_buffers(transition_cache_dir: str, capacity: int) -> tuple:
+def load_cached_replay_buffers(
+    transition_cache_dirs: str | list[str], capacity: int, mix_weights: list[float] | None = None
+) -> tuple:
+    """Train/val buffers over one or more caches; several caches are mixed per batch by `mix_weights`.
+
+    A cache without a val split (e.g. a rollout bucket built with val_ratio 0) only feeds training; val is
+    None when no cache has one.
+    """
     from evo_rlt.adapters.lerobot.offline_dataset import load_transition_cache
 
-    train_buffer = load_transition_cache(transition_cache_dir, "train", capacity=capacity)
-    val_buffer = load_transition_cache(transition_cache_dir, "val", capacity=capacity)
-    return train_buffer, val_buffer
+    dirs = [transition_cache_dirs] if isinstance(transition_cache_dirs, str) else list(transition_cache_dirs)
+    if mix_weights is not None:
+        if len(mix_weights) != len(dirs):
+            raise ValueError(f"cache_mix_weights has {len(mix_weights)} values for {len(dirs)} transition cache dirs")
+        if any(w <= 0 for w in mix_weights):
+            raise ValueError(f"cache_mix_weights must be positive, got {mix_weights}")
+    names = [f"{i}:{Path(d).name}" for i, d in enumerate(dirs)]
+    train = {name: load_transition_cache(d, "train", capacity=capacity) for name, d in zip(names, dirs)}
+    val = {
+        name: load_transition_cache(d, "val", capacity=capacity)
+        for name, d in zip(names, dirs)
+        if (Path(d) / "chunk_transitions_val.pt").exists()
+    }
+    if len(train) == 1:
+        (name,) = train
+        if name not in val:
+            logger.warning("%s has no val split; training without validation", dirs[0])
+        return train[name], val.get(name)
+
+    total = sum(len(buf) for buf in train.values())
+    weights = dict(zip(names, mix_weights or [len(buf) / total for buf in train.values()]))
+    weight_sum = sum(weights.values())
+    for name, d in zip(names, dirs):
+        logger.info(
+            "Train cache %s: %d transitions, %.1f%% of each batch; val: %s",
+            d, len(train[name]), 100.0 * weights[name] / weight_sum,
+            f"{len(val[name])} transitions" if name in val else "none (train only)",
+        )
+    return _mixed_buffer(train, weights), _mixed_buffer(val, weights)
+
+
+def _mixed_buffer(buffers: dict, weights: dict[str, float]):
+    from evo_rlt.core.mix_dataset import WeightedMixReplayBuffer
+
+    if not buffers:
+        return None
+    if len(buffers) == 1:
+        return next(iter(buffers.values()))
+    return WeightedMixReplayBuffer(buffers, {name: weights[name] for name in buffers})
 
 
 def build_live_replay_buffers(policy, args: argparse.Namespace, config) -> tuple:
+    from evo_rlt.adapters.lerobot.demo_loader import load_policy_normalization_stats
     from evo_rlt.adapters.lerobot.offline_dataset import build_transition_replay_buffer
 
+    normalization_stats = load_policy_normalization_stats(args.model_path)
     logger.info("Building train replay buffer from %s", args.demo_dataset_path)
     train_buffer = build_transition_replay_buffer(
         policy=policy,
@@ -79,6 +148,7 @@ def build_live_replay_buffers(policy, args: argparse.Namespace, config) -> tuple
         config=config,
         split="train",
         device=args.device,
+        normalization_stats=normalization_stats,
     )
     logger.info("Building val replay buffer from %s", args.demo_dataset_path)
     val_buffer = build_transition_replay_buffer(
@@ -87,8 +157,28 @@ def build_live_replay_buffers(policy, args: argparse.Namespace, config) -> tuple
         config=config,
         split="val",
         device=args.device,
+        normalization_stats=normalization_stats,
     )
     return train_buffer, val_buffer
+
+
+def configure_action_bounds(actor, buffer, margin: float | None) -> None:
+    """Bound the TD-target action to the range of the executed actions the critic is trained on."""
+    from evo_rlt.core.mix_dataset import WeightedMixReplayBuffer
+
+    if margin is None:
+        logger.info("Action bounds: fixed [-1, 1] (actor.action_bound_margin is null)")
+        return
+    buffers = buffer.buckets.values() if isinstance(buffer, WeightedMixReplayBuffer) else [buffer]
+    actions = torch.cat([t.exec_chunk for buf in buffers for t in buf.buffer])  # (N * C, action_dim)
+    low, high = actions.amin(dim=0), actions.amax(dim=0)
+    pad = margin * (high - low)
+    actor.set_action_bounds(low - pad, high + pad)
+    logger.info(
+        "Action bounds from %d executed actions (margin %.2f): low=%s high=%s",
+        actions.shape[0], margin,
+        [round(v, 3) for v in (low - pad).tolist()], [round(v, 3) for v in (high + pad).tolist()],
+    )
 
 
 def create_algorithm_with_cached_transitions(config, rl_token_checkpoint: str | None, device: str):
@@ -152,17 +242,26 @@ def main() -> None:
     config = load_training_config(args.config)
     apply_overrides(config, args)
 
+    metadata = None
     if args.transition_cache_dir is not None:
         logger.info("Loading transition cache from %s", args.transition_cache_dir)
-        train_buffer, val_buffer = load_cached_replay_buffers(args.transition_cache_dir, config.replay.capacity)
+        train_buffer, val_buffer = load_cached_replay_buffers(
+            args.transition_cache_dir, config.replay.capacity, args.cache_mix_weights
+        )
+        metadata = {"transition_cache_dirs": list(args.transition_cache_dir), "cache_mix_weights": args.cache_mix_weights}
         algorithm = create_algorithm_with_cached_transitions(config, args.rl_token_checkpoint, args.device)
     else:
+        if args.cache_mix_weights is not None:
+            raise ValueError("--cache-mix-weights needs --transition-cache-dir")
         if args.demo_dataset_path is None:
             raise ValueError("--demo-dataset-path is required when --transition-cache-dir is not provided")
         algorithm = create_algorithm_with_pi05(config, args)
         train_buffer, val_buffer = build_live_replay_buffers(algorithm.policy, args, config)
+    configure_action_bounds(algorithm.policy.actor, train_buffer, config.actor.action_bound_margin)
 
-    logger.info("Train transitions: %d, Val transitions: %d", len(train_buffer), len(val_buffer))
+    logger.info(
+        "Train transitions: %d, Val transitions: %s", len(train_buffer), len(val_buffer) if val_buffer else "none"
+    )
     logger.info(
         "Training chunk actor-critic: steps=%d batch_size=%d beta=%.2f actor_lr=%.2e critic_lr=%.2e",
         config.offline_rl.num_gradient_steps,
@@ -184,6 +283,7 @@ def main() -> None:
         actor_optimizer=actor_optimizer,
         critic_optimizer=critic_optimizer,
         save_dir=args.output_dir,
+        metadata=metadata,
     )
     elapsed = time.time() - start_time
     logger.info(
@@ -193,6 +293,9 @@ def main() -> None:
         len(metrics.actor_losses),
     )
 
+    if val_buffer is None:
+        logger.info("No val split in any transition cache; skipping offline eval")
+        return
     eval_metrics = evaluate_offline(algorithm, val_buffer, config, num_batches=10)
     logger.info(
         "Eval: expert_mse=%.4f ref_mse=%.4f q_policy=%.4f q_expert=%.4f q_gap=%.4f td_err=%.4f",

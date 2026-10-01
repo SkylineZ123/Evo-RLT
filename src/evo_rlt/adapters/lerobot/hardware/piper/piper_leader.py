@@ -28,7 +28,9 @@ from evo_rlt.adapters.lerobot.hardware.piper.agx_arm import (
     PIPER_TEACH_CTRL_MODES,
     guard_piper_ctrl_mode_on_connect,
     make_piper_arm,
-    read_piper_ctrl_mode,
+    piper_teach_engaged,
+    read_piper_mode_status,
+    seed_piper_position_target,
     wait_enable_piper,
 )
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -75,6 +77,9 @@ class PiperLeader(Teleoperator):
         self._teach_mode_last_poll_t = 0.0
         self._teach_mode_pending: bool | None = None
         self._teach_mode_pending_since = 0.0
+        # ctrl_mode from the latest status poll. It stays TEACH after the drag has ended,
+        # until the host requests CAN control.
+        self._last_ctrl_mode: int | None = None
 
         self.arm = None
         self.gripper = None
@@ -287,6 +292,18 @@ class PiperLeader(Teleoperator):
                     self,
                 )
                 return
+            if self._last_ctrl_mode in PIPER_TEACH_CTRL_MODES:
+                # The drag has ended, but the arm stays in ctrl_mode TEACH until the mode
+                # frame below requests CAN control. Hold the measured pose as the position
+                # target first, so the switch does not chase a stale target stored in firmware.
+                if not seed_piper_position_target(self.arm):
+                    logger.warning(
+                        "%s: no joint feedback to seed the position target; staying out of CAN "
+                        "command mode rather than risking a jump. Will retry on the next command.",
+                        self,
+                    )
+                    return
+                logger.info("%s: drag ended; requesting CAN control from teach mode.", self)
             self._send_command_mode()
             if not self._wait_enable(self.config.enable_timeout_s):
                 logger.warning("Piper leader did not report enabled state before timeout.")
@@ -303,13 +320,16 @@ class PiperLeader(Teleoperator):
         self._teach_mode_last_poll_t = 0.0
         self._teach_mode_pending = None
         self._teach_mode_pending_since = 0.0
+        self._last_ctrl_mode = None
 
     def is_teach_mode_active(self) -> bool:
-        """Report whether the operator has the arm in teaching mode.
+        """Report whether the operator has the arm in teaching mode (teach button engaged).
 
-        Pressing the teach button on the arm switches its ``ctrl_mode`` to a teaching
-        value; pressing it again returns the arm to a mode that accepts CAN commands.
-        The status frame is read at most every ``teach_mode_poll_interval_s`` and a new
+        Pressing the teach button switches the arm's ``ctrl_mode`` to TEACH and starts a drag
+        (``teach_status`` 1). Pressing it again ends the drag (``teach_status`` 2) but leaves
+        ``ctrl_mode`` at TEACH until the host requests CAN control, which
+        :meth:`set_manual_control` does; so the drag state, not ``ctrl_mode``, is reported
+        (see :func:`piper_teach_engaged`). The status frame is read at most every ``teach_mode_poll_interval_s`` and a new
         reading must hold for ``teach_mode_debounce_s`` before it is reported, so this
         is cheap enough to call once per control tick and does not chatter while the
         firmware switches modes.
@@ -325,12 +345,14 @@ class PiperLeader(Teleoperator):
             return self._teach_mode_active
         self._teach_mode_last_poll_t = now
 
-        mode = read_piper_ctrl_mode(self.arm, timeout_s=0.0)
-        if mode is None:
+        reading = read_piper_mode_status(self.arm)
+        if reading is None:
             logger.debug("%s: no arm status frame available; keeping last teach-mode state.", self)
             return self._teach_mode_active
 
-        observed = mode in PIPER_TEACH_CTRL_MODES
+        mode, teach_status = reading
+        self._last_ctrl_mode = mode
+        observed = piper_teach_engaged(mode, teach_status)
         if observed == self._teach_mode_active:
             self._teach_mode_pending = None
             return self._teach_mode_active
@@ -342,10 +364,11 @@ class PiperLeader(Teleoperator):
             self._teach_mode_active = observed
             self._teach_mode_pending = None
             logger.info(
-                "%s teach button %s (ctrl_mode=0x%02X).",
+                "%s teach button %s (ctrl_mode=0x%02X, teach_status=%s).",
                 self,
-                "pressed - operator has the arm" if observed else "released - arm back under CAN control",
+                "pressed - operator has the arm" if observed else "released - control can return to the host",
                 mode,
+                teach_status,
             )
         return self._teach_mode_active
 

@@ -23,6 +23,7 @@ ACTUAL_STEPS = "actual_steps"
 SOURCE = "source"
 EPISODE_ID = "episode_id"
 IS_CRITICAL = "is_critical"
+BC_TARGET_FLAT = "bc_target_flat"
 
 
 @dataclass
@@ -60,3 +61,6 @@ class ChunkTransition:
     source: torch.Tensor = field(default_factory=lambda: torch.tensor(0))
     episode_id: torch.Tensor = field(default_factory=lambda: torch.tensor(-1))
     is_critical: torch.Tensor = field(default_factory=lambda: torch.tensor(0.0))
+    # (C, action_dim) target of the actor's BC term; None = ref_chunk. Lets a human-corrected chunk keep
+    # the VLA ref as the actor input (what deploy feeds it) while the BC term pulls toward the human action.
+    bc_target_chunk: torch.Tensor | None = None

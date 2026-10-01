@@ -408,3 +408,13 @@ class StatusView:
             put("SUBTASK:", 10, y, yellow, 0.6, 1)
             y += 36
             put_fit(skill_text, 10, y + 12, yellow, 1, 3, max_w=panel.shape[1] - 20)
+            y += 48
+
+        # Free-form `(text, color_name, scale)` rows from callers with more state to show,
+        # e.g. the policy-rollout recorder (control source, teach button, queued handover).
+        colors = {"white": white, "grey": grey, "yellow": yellow, "green": green, "red": red}
+        for text, color, scale in status.get("lines") or ():
+            # Text taller than the rows above needs extra room above its baseline.
+            y += int(max(0.0, scale - 0.6) * 30)
+            put_fit(text, 10, y, colors.get(color, white), scale, 2 if scale >= 0.8 else 1, panel.shape[1] - 20)
+            y += max(22, int(40 * scale))

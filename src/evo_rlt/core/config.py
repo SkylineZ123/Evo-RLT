@@ -35,8 +35,18 @@ class RLTokenConfig:
             setattr(self, key, value)
 
 
+def _check_head_arch(section: str, arch: str) -> None:
+    from evo_rlt.core.actor import HEAD_ARCHS
+
+    if arch not in HEAD_ARCHS:
+        raise ValueError(f"{section}.arch must be one of {HEAD_ARCHS}, got {arch!r}")
+
+
 @dataclass
 class ActorConfig:
+    # "mlp" = one MLP over [z_rl, proprio, ref]; "openpi" = openpi-RLT's per-input LN projections +
+    # LN/GELU trunk (core.actor.OpenpiMLP). activation / layer_norm / residual only apply to "mlp".
+    arch: str = "mlp"
     hidden_dim: int = 256
     num_layers: int = 2
     fixed_std: float = 0.05
@@ -45,16 +55,27 @@ class ActorConfig:
     activation: str = "relu"
     layer_norm: bool = False
     residual: bool = False
+    # Action bounds = per-dim [min, max] of the training executed actions, widened by this fraction
+    # of the range on each side. They clamp the TD-target action and the deployed RL-phase action, so
+    # 0.0 keeps the robot inside joint values the demos actually reached. None keeps the fixed [-1, 1].
+    action_bound_margin: float | None = 0.0
+
+    def __post_init__(self):
+        _check_head_arch("actor", self.arch)
 
 
 @dataclass
 class CriticConfig:
+    arch: str = "mlp"  # see ActorConfig.arch
     hidden_dim: int = 256
     num_layers: int = 2
     lr: float = 3e-4
     activation: str = "relu"
     layer_norm: bool = False
     residual: bool = False
+
+    def __post_init__(self):
+        _check_head_arch("critic", self.arch)
 
 
 @dataclass

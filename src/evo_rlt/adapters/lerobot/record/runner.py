@@ -4,7 +4,6 @@ import argparse
 import logging
 import runpy
 import sys
-import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -31,24 +30,18 @@ from evo_rlt.adapters.lerobot.record.common import (
     stage_leader_calibrations,
     stage_setup_follower_calibrations,
 )
+from evo_rlt.adapters.lerobot.record.rollout_status import rollout_controls_help
 
 log = logging.getLogger(__name__)
 
 
 def prepare_lerobot_runtime(
     *,
-    double_tap_episode_outcome_key: str | None = None,
-    double_tap_episode_outcome_window_s: float | None = None,
     intervention_toggle_key: str | None = None,
     skip_policyless_reset_loop: bool = False,
     background_episode_video_encoding: bool = False,
 ) -> None:
-    if double_tap_episode_outcome_key is not None and double_tap_episode_outcome_window_s is None:
-        raise ValueError("double_tap_episode_outcome_window_s is required")
-    _patch_double_tap_episode_outcome_listener(
-        double_tap_episode_outcome_window_s or 0.0,
-        double_tap_episode_outcome_key,
-    )
+    _patch_record_key_listener()
     register()
     if intervention_toggle_key is not None:
         _patch_record_intervention_toggle_key(intervention_toggle_key)
@@ -94,56 +87,6 @@ def _pynput_key_name(key: Any, keyboard_module: Any) -> str | None:
     return None
 
 
-class _DoubleTapEpisodeOutcomeRouter:
-    def __init__(
-        self,
-        events: dict[str, Any],
-        outcome_key: str,
-        double_tap_window_s: float,
-    ) -> None:
-        self._events = events
-        self._outcome_key = _event_key_name(outcome_key)
-        self._double_tap_window_s = double_tap_window_s
-        self._timer: threading.Timer | None = None
-        self._lock = threading.Lock()
-
-    def on_press(self, key_name: str) -> None:
-        if _event_key_name(key_name) != self._outcome_key:
-            return
-        with self._lock:
-            if self._timer is None:
-                timer = threading.Timer(self._double_tap_window_s, self._mark_success)
-                timer.daemon = True
-                self._timer = timer
-                timer.start()
-                logging.info(
-                    "Episode outcome pending; tap '%s' again within %.1fs for failure",
-                    self._outcome_key,
-                    self._double_tap_window_s,
-                )
-                return
-            self._timer.cancel()
-            self._timer = None
-            self._events["episode_outcome"] = "failure"
-            self._events["exit_early"] = True
-        logging.info("Episode outcome resolved as failure")
-
-    def _mark_success(self) -> None:
-        with self._lock:
-            if self._timer is None:
-                return
-            self._timer = None
-            self._events["episode_outcome"] = "success"
-            self._events["exit_early"] = True
-        logging.info("Episode outcome resolved as success")
-
-    def stop(self) -> None:
-        with self._lock:
-            if self._timer is not None:
-                self._timer.cancel()
-                self._timer = None
-
-
 PEDAL_TOGGLE_COOLDOWN_S = 0.5
 # Pseudo event names for plain success/failure keys: they set `episode_outcome` and end the episode.
 _EPISODE_OUTCOME_EVENT_PREFIX = "episode_outcome:"
@@ -161,7 +104,6 @@ def _fire_record_event(events: dict[str, Any], event_name: str) -> None:
 def _start_record_event_pedal_listener(
     events: dict[str, Any],
     key_bindings: dict[str | None, str | None],
-    outcome_router: _DoubleTapEpisodeOutcomeRouter | None = None,
 ):
     from evo_rlt.adapters.lerobot.record.pedal_listener import PedalListener
 
@@ -171,7 +113,7 @@ def _start_record_event_pedal_listener(
         if key_name is not None and event_name is not None and key_name not in event_by_key:
             event_by_key[key_name] = event_name
 
-    if outcome_router is None and not event_by_key:
+    if not event_by_key:
         logging.info("No pedal key bindings configured; pedal listener skipped")
         return None
 
@@ -182,8 +124,6 @@ def _start_record_event_pedal_listener(
         normalized_key = _event_key_name(key_name)
         if normalized_key is None:
             return
-        if outcome_router is not None:
-            outcome_router.on_press(normalized_key)
         event_name = event_by_key.get(normalized_key)
         if event_name is None:
             return
@@ -199,28 +139,6 @@ def _start_record_event_pedal_listener(
     if listener.start():
         return listener
     return None
-
-
-def _start_double_tap_keyboard_listener(
-    outcome_key: str,
-    router: _DoubleTapEpisodeOutcomeRouter,
-):
-    import lerobot.utils.control_utils as control_utils
-
-    if control_utils.is_headless():
-        return None
-    from pynput import keyboard
-
-    normalized_outcome_key = _event_key_name(outcome_key)
-
-    def on_press(key: Any) -> None:
-        key_name = _pynput_key_name(key, keyboard)
-        if key_name == normalized_outcome_key:
-            router.on_press(key_name)
-
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-    return listener
 
 
 def _start_record_event_keyboard_listener(events: dict[str, Any], key_bindings: dict[str | None, str | None]):
@@ -261,19 +179,16 @@ def _ensure_record_events(events: dict[str, Any]) -> None:
         events.setdefault(event_name, False)
 
 
-def _patch_double_tap_episode_outcome_listener(
-    double_tap_window_s: float,
-    outcome_key: str | None,
-) -> None:
+def _patch_record_key_listener() -> None:
     """Make `init_keyboard_listener` accept the record key bindings as keyword arguments.
 
-    With ``outcome_key`` the episode outcome comes from a single/double tap of that key (and
-    the pedal). Without it, ``episode_success_key`` / ``episode_failure_key`` label and end
-    the episode directly, unless another control already owns the key.
+    Each bound key sets its event flag for the recording loop, from the keyboard and from the
+    pedal. ``episode_success_key`` / ``episode_failure_key`` label and end the episode
+    directly, unless another control (the RL phase's s / f) already owns the key.
     """
     import lerobot.utils.control_utils as control_utils
 
-    if getattr(control_utils.init_keyboard_listener, "_evo_rlt_double_tap_episode_outcome", False):
+    if getattr(control_utils.init_keyboard_listener, "_evo_rlt_record_keys", False):
         return
 
     original_init_keyboard_listener = control_utils.init_keyboard_listener
@@ -290,11 +205,6 @@ def _patch_double_tap_episode_outcome_listener(
         end_failure_key = kwargs.pop("end_failure_key", None)
         keyboard_listener, events = original_init_keyboard_listener()
         _ensure_record_events(events)
-        router = (
-            _DoubleTapEpisodeOutcomeRouter(events, outcome_key, double_tap_window_s)
-            if outcome_key is not None
-            else None
-        )
         record_key_bindings = {
             intervention_toggle_key: "toggle_intervention",
             critical_phase_toggle_key: "toggle_critical_phase",
@@ -304,24 +214,15 @@ def _patch_double_tap_episode_outcome_listener(
             end_success_key: "end_phase_success",
             end_failure_key: "end_phase_failure",
         }
-        if router is None:
-            bound_keys = {
-                _event_key_name(key) for key, event in record_key_bindings.items() if event is not None
-            }
-            for key, outcome in ((episode_success_key, "success"), (episode_failure_key, "failure")):
-                if _event_key_name(key) is not None and _event_key_name(key) not in bound_keys:
-                    record_key_bindings[key] = f"{_EPISODE_OUTCOME_EVENT_PREFIX}{outcome}"
-        pedal_listener = _start_record_event_pedal_listener(events, record_key_bindings, router)
-        extra_keyboard_listener = (
-            _start_double_tap_keyboard_listener(outcome_key, router) if router is not None else None
-        )
+        bound_keys = {_event_key_name(key) for key, event in record_key_bindings.items() if event is not None}
+        for key, outcome in ((episode_success_key, "success"), (episode_failure_key, "failure")):
+            if _event_key_name(key) is not None and _event_key_name(key) not in bound_keys:
+                record_key_bindings[key] = f"{_EPISODE_OUTCOME_EVENT_PREFIX}{outcome}"
+        pedal_listener = _start_record_event_pedal_listener(events, record_key_bindings)
         record_event_listener = _start_record_event_keyboard_listener(events, record_key_bindings)
-        return (
-            _CompositeListener(keyboard_listener, pedal_listener, extra_keyboard_listener, record_event_listener, router),
-            events,
-        )
+        return _CompositeListener(keyboard_listener, pedal_listener, record_event_listener), events
 
-    init_keyboard_listener._evo_rlt_double_tap_episode_outcome = True
+    init_keyboard_listener._evo_rlt_record_keys = True
     control_utils.init_keyboard_listener = init_keyboard_listener
 
 
@@ -460,15 +361,8 @@ def _validate_distinct_keys(**keys: str | None) -> None:
         seen[normalized] = label
 
 
-def _collect_external_episode_outcome_key(args: argparse.Namespace) -> str | None:
-    if args.only_critical:
-        return None
-    return args.rlt_toggle_key
-
-
-def _episode_outcome_argv(enabled: bool, default_episode_success: str | None = None) -> list[str]:
-    if not enabled:
-        return []
+def _episode_outcome_argv(default_episode_success: str | None = None) -> list[str]:
+    """s / f label and end every episode; one ended any other way is discarded, not saved."""
     argv = [
         "--enable_episode_outcome_labeling=true",
         "--require_episode_success_label=true",
@@ -478,34 +372,41 @@ def _episode_outcome_argv(enabled: bool, default_episode_success: str | None = N
     return argv
 
 
+def _status_view_argv(args: argparse.Namespace) -> list[str]:
+    return ["--status_view=true"] if getattr(args, "status_view", False) else []
+
+
+def _import_cv2_for_status_view(args: argparse.Namespace) -> None:
+    """Load OpenCV before PyAV (pulled in by lerobot.datasets), or the window deadlocks.
+
+    See `status_view.shadowed_x11_libs`.
+    """
+    if getattr(args, "status_view", False) and not args.dry_run:
+        import cv2  # noqa: F401
+
+
 def _collect_rlt_phase_argv(args: argparse.Namespace) -> list[str]:
     common = [
         "--rlt.enable=true",
         f"--rlt.rl_phase_key={_keyboard_key_arg(args.rlt_toggle_key)}",
-        f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
-    ]
-    if args.only_critical:
-        return [
-            *common,
-            "--rlt.skip_prefix_recording=true",
-            "--rlt.rl_phase_key_toggles_episode=true",
-            f"--rlt.start_in_teleop={'true' if args.start_with_teleop else 'false'}",
-        ]
-    return [
-        *common,
         f"--rlt.start_in_teleop={'true' if args.start_with_teleop else 'false'}",
     ]
+    if args.only_critical:
+        # r starts the RL phase and the recorded segment; s / f end the episode.
+        return [*common, "--rlt.skip_prefix_recording=true", "--rlt.rl_phase_key_toggles_episode=true"]
+    # r switches VLA <-> RL inside one fully recorded episode; s / f end it.
+    return [*common, "--rlt.rl_phase_key_toggles_critical_phase=true"]
 
 
 def run_collect(args: argparse.Namespace) -> None:
     set_offline_env()
-    episode_outcome_key = _collect_external_episode_outcome_key(args)
-    validation_keys = {"teleop_toggle_key": args.teleop_toggle_key}
-    if args.only_critical:
-        validation_keys["rlt_toggle_key"] = args.rlt_toggle_key
-    else:
-        validation_keys["episode_outcome_key"] = episode_outcome_key
-    _validate_distinct_keys(**validation_keys)
+    _validate_distinct_keys(
+        rlt_toggle_key=args.rlt_toggle_key,
+        teleop_toggle_key=args.teleop_toggle_key,
+        success_key="s",
+        failure_key="f",
+    )
+    _import_cv2_for_status_view(args)
     setup = load_robot_setup(args.setup_json)
     paths = resolve_record_paths(setup.setup, args.dataset_tag, "eval_vla_rlt_vla", args.resume)
     configure_logging(paths.log_file, args.log_level)
@@ -530,10 +431,6 @@ def run_collect(args: argparse.Namespace) -> None:
             return
 
         prepare_lerobot_runtime(
-            double_tap_episode_outcome_key=episode_outcome_key,
-            double_tap_episode_outcome_window_s=(
-                args.double_tap_window_s if episode_outcome_key is not None else None
-            ),
             intervention_toggle_key=args.teleop_toggle_key,
             skip_policyless_reset_loop=args.only_critical and not args.start_with_teleop,
             background_episode_video_encoding=True,
@@ -582,14 +479,12 @@ def build_default_collect_record_argv(
             vla_execution_horizon=args.vla_rtc_execution_horizon,
             action_queue_size_to_get_new_actions=args.rtc_action_queue_size_to_get_new_actions,
         ),
-        *_episode_outcome_argv(
-            args.only_critical or _collect_external_episode_outcome_key(args) is not None,
-            getattr(args, "default_episode_success", None),
-        ),
+        *_episode_outcome_argv(getattr(args, "default_episode_success", None)),
         "--intervention_state_machine_enabled=true",
         f"--policy_sync_to_teleop={'true' if teleop_argv else 'false'}",
         f"--vla_ref={'true' if args.vla_ref else 'false'}",
         f"--play_sounds={'true' if args.play_sounds else 'false'}",
+        *_status_view_argv(args),
     ]
     return argv
 
@@ -609,33 +504,24 @@ def print_collect_summary(args: argparse.Namespace, paths) -> None:
         f"schedule={args.rtc_prefix_attention_schedule} "
         f"refill_threshold={args.rtc_action_queue_size_to_get_new_actions}"
     )
+    rl_key = args.rlt_toggle_key
     if args.only_critical:
         print(
-            f"Recording mode: RLT critical segment only. {args.rlt_toggle_key} enters RLT and starts recording; "
-            f"the next {args.rlt_toggle_key} saves success; "
-            f"{args.rlt_toggle_key}+{args.rlt_toggle_key} inside "
-            f"{args.double_tap_window_s:.1f}s saves failure."
+            f"Recording mode: RLT critical segment only. {rl_key} enters RLT and starts recording "
+            f"(pressing it again is ignored); s / f end the episode as success / failure."
         )
     else:
         print(
-            f"Recording mode: full trajectory. Recording starts immediately; "
-            f"{args.rlt_toggle_key} saves success after {args.double_tap_window_s:.1f}s; "
-            f"double-tap {args.rlt_toggle_key} saves failure."
+            f"Recording mode: full trajectory. Recording starts immediately; {rl_key} switches "
+            f"VLA <-> RLT; s / f end the episode as success / failure."
         )
     print(f"Episode starts with: {'teleop' if args.start_with_teleop else 'VLA'}")
-    if args.only_critical:
-        rlt_control = f"{args.rlt_toggle_key}=start/end RLT critical recording"
-    else:
-        rlt_control = f"{args.rlt_toggle_key}=save full-episode outcome"
-    print(
-        "Controls: "
-        f"{rlt_control}, "
-        f"{args.teleop_toggle_key}=toggle teleop intervention"
-    )
+    print(f"Controls: {rollout_controls_help(rl_key, args.teleop_toggle_key)}")
 
 
 def run_segment(args: argparse.Namespace) -> None:
     set_offline_env()
+    _import_cv2_for_status_view(args)
     setup = load_robot_setup(args.setup_json)
     paths = resolve_record_paths(
         setup.setup, args.dataset_tag, f"eval_{args.critical_source}_segment", args.resume
@@ -708,7 +594,6 @@ def build_segment_record_argv(args, setup, paths, cal_dir: str, teleop_argv: lis
         "--rlt.skip_prefix_recording=true",
         "--rlt.rl_phase_key_toggles_episode=true",
         f"--rlt.start_in_teleop={'true' if args.initial_source == 'teleop' else 'false'}",
-        f"--rlt.rl_phase_double_tap_window_s={args.double_tap_window_s}",
         f"--rlt.intervention_action_blend_time_s={args.intervention_action_blend_time_s}",
         *build_rtc_argv(
             enabled=args.rtc,
@@ -718,7 +603,7 @@ def build_segment_record_argv(args, setup, paths, cal_dir: str, teleop_argv: lis
             vla_execution_horizon=args.vla_rtc_execution_horizon,
             action_queue_size_to_get_new_actions=args.rtc_action_queue_size_to_get_new_actions,
         ),
-        "--enable_episode_outcome_labeling=true",
+        *_episode_outcome_argv(getattr(args, "default_episode_success", None)),
         "--intervention_state_machine_enabled=true",
         (
             "--policy_sync_to_teleop="
@@ -726,6 +611,7 @@ def build_segment_record_argv(args, setup, paths, cal_dir: str, teleop_argv: lis
         ),
         f"--vla_ref={'true' if args.vla_ref else 'false'}",
         "--play_sounds=true",
+        *_status_view_argv(args),
     ]
     return argv
 
@@ -747,7 +633,9 @@ def build_segment_policy_argv(args: argparse.Namespace) -> list[str]:
 
 
 def build_policy_compile_argv(args: argparse.Namespace) -> list[str]:
-    return build_compile_overrides(args.policy_path, args.compile_mode if args.compile_model else None)
+    return build_compile_overrides(
+        args.policy_path, args.compile_mode if args.compile_model else None, rtc=args.rtc
+    )
 
 
 def apply_compile_cache_dir(args: argparse.Namespace) -> None:
@@ -780,14 +668,15 @@ def print_segment_summary(args: argparse.Namespace, paths) -> None:
     if args.policy_path is not None:
         print(f"Policy: {args.policy_path}")
     print(
-        "Segment outcome mode: r starts the recorded critical segment; "
-        "r ends it as success; r+r inside "
-        f"{args.double_tap_window_s:.1f}s marks failure."
+        "Segment mode: r starts the recorded critical segment (pressing it again is ignored); "
+        "s / f end the episode as success / failure."
     )
+    print(f"Controls: {rollout_controls_help()}")
 
 
 def run_full(args: argparse.Namespace) -> None:
     set_offline_env()
+    _import_cv2_for_status_view(args)
     setup = load_robot_setup(args.setup_json)
     paths = resolve_record_paths(
         setup.setup, args.dataset_tag, f"eval_{args.initial_source}_full", args.resume
@@ -838,24 +727,18 @@ def run_full(args: argparse.Namespace) -> None:
                 vla_execution_horizon=args.vla_rtc_execution_horizon,
                 action_queue_size_to_get_new_actions=args.rtc_action_queue_size_to_get_new_actions,
             ),
-            *_episode_outcome_argv(True, args.default_episode_success),
+            *_episode_outcome_argv(args.default_episode_success),
             "--intervention_state_machine_enabled=true",
             f"--policy_sync_to_teleop={'true' if teleop_argv and args.initial_source == 'vla' else 'false'}",
             "--play_sounds=true",
+            *_status_view_argv(args),
         ]
+        print(f"Controls: {rollout_controls_help(None, 'space' if teleop_argv else None)}")
         if args.dry_run:
             print(" ".join(sys.argv))
             return
         apply_compile_cache_dir(args)
-        prepare_lerobot_runtime(
-            double_tap_episode_outcome_key=(
-                args.episode_outcome_key if args.pedal_outcome else None
-            ),
-            double_tap_episode_outcome_window_s=(
-                args.double_tap_window_s if args.pedal_outcome else None
-            ),
-            background_episode_video_encoding=True,
-        )
+        prepare_lerobot_runtime(background_episode_video_encoding=True)
         from evo_rlt.adapters.lerobot.record.backend import record
 
         record()

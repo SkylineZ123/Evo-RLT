@@ -2,9 +2,8 @@
 #
 #   evo-rlt-record --config configs/record/piper_full_vla.yaml
 #
-# 按键（pedal_outcome: false）：s 结束 episode 并标 success，f 标 failure
-# 按键（pedal_outcome: true）：r（或踏板）单击标 success，双击标 failure
-# i 人工接管 / 交还（接管期间用主臂示教按钮拖动）  ← 重录当前 episode  Esc 结束
+# 按键：s / f 结束 episode 并标 success / failure
+#       space 人工接管 / 交还（接管期间用主臂示教按钮拖动）  ← 重录当前 episode  Esc 结束
 # 没按 s/f 就用 ← / → / Esc（或超时）结束的 episode 没有成功标签，会被丢弃而不是保存。
 # 如需只录纯策略（不接主臂），设 no_teleop: true。
 
@@ -37,9 +36,6 @@ dataset_tag: piper_full_vla
 resume: null               # 接着已有数据集采集：true = 本 dataset_tag 下最近一次有数据的数据集；也可填数据集目录；null = 新建
 vcodec: h264
 
-pedal_outcome: false       # true：用 episode_outcome_key 单击/双击（及踏板）标记成功/失败
-episode_outcome_key: r     # 仅 pedal_outcome: true 时生效
-double_tap_window_s: 0.6
 default_episode_success: null
 no_teleop: false
 
@@ -50,5 +46,6 @@ rtc_max_guidance_weight: 10.0
 rtc_prefix_attention_schedule: EXP
 rtc_action_queue_size_to_get_new_actions: null
 
+status_view: true          # 相机画面 + 采集状态窗口
 log_level: INFO
 dry_run: false

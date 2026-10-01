@@ -111,6 +111,7 @@ from evo_rlt.adapters.lerobot.record.hil import (
 )
 from evo_rlt.adapters.lerobot.record.loop import record_loop
 from evo_rlt.adapters.lerobot.record.piper_session import is_piper_leader, prepare_piper_leader
+from evo_rlt.adapters.lerobot.record.rollout_status import rollout_controls_help
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
     bi_openarm_leader,
@@ -232,17 +233,14 @@ class RLTRecordConfig:
     # wo_prefix mode: drop frames captured during PHASE_PREFIX (before RL phase
     # starts). Used when the dataset should only contain the RL-driven segment.
     skip_prefix_recording: bool = False
-    # wo_prefix mode: rl_phase_key toggles - first press starts the episode (and
-    # RL phase), second press ends the episode (sets exit_early). Single end
-    # press marks the episode as success; a follow-up press inside
-    # `rl_phase_double_tap_window_s` marks it as failure.
+    # wo_prefix mode: rl_phase_key starts the RL phase (and, with
+    # skip_prefix_recording, the recorded segment); pressing it again is ignored.
+    # The episode ends only through end_success_key / end_failure_key.
     rl_phase_key_toggles_episode: bool = False
-    # With-prefix mode: rl_phase_key toggles the critical phase only - first
-    # press starts RL, second press ends RL and marks the critical phase
-    # (success by default, failure if a second press lands inside the
-    # double-tap window). Episode keeps going in VLA mode afterwards.
+    # With-prefix mode: rl_phase_key toggles VLA <-> RL inside one episode, which
+    # keeps recording throughout. The outcome is set with end_success_key /
+    # end_failure_key, which also end the episode.
     rl_phase_key_toggles_critical_phase: bool = False
-    rl_phase_double_tap_window_s: float = 0.6
     # wo_prefix mode: start each episode in human-teleop state (leader drives
     # follower, no policy actions sent) until the user presses the rl_phase_key
     # to enter RL. Required for pure RL-only HIL recording where VLA should
@@ -289,13 +287,11 @@ class RecordConfig:
     intervention_state_machine_enabled: bool = True
     # Keyboard key used to toggle entering/leaving intervention.
     intervention_toggle_key: str = "i"
-    # Pure-teleop mode: r key starts an episode (entering critical phase),
-    # second r press ends the episode and marks it success; a double-tap
-    # inside `rlt.rl_phase_double_tap_window_s` marks it failure. No VLA,
-    # no RL inference, no SPACE intervention - teleop drives the entire
-    # time, r is the only episode-control input. Requires policy to be
-    # None (teleop-only) and reuses the same underlying state machine as
-    # the rlt wo_prefix recorder.
+    # Pure-teleop mode: r key starts recording an episode (entering critical
+    # phase); s / f end it as success / failure. No VLA, no RL inference, no
+    # SPACE intervention - teleop drives the entire time. Requires policy to be
+    # None (teleop-only) and reuses the same underlying state machine as the
+    # rlt wo_prefix recorder.
     teleop_r_key_episodes: bool = False
     # Whether to capture episode-level success/failure labels from keyboard.
     enable_episode_outcome_labeling: bool = False
@@ -334,6 +330,9 @@ class RecordConfig:
     # Piper leader only: seconds spent ramping the leader and follower onto one pose after
     # connect (the leader cannot be backdriven from software, so neither arm may jump).
     piper_align_time_s: float = 3.0
+    # Open an OpenCV window with the camera feeds and the rollout state: control source
+    # (VLA / RLT / HUMAN), recording, leader teach mode, queued handover, session counters.
+    status_view: bool = False
 
     def __post_init__(self):
         if self.robot_config_file is not None:
@@ -615,9 +614,19 @@ def _configure_rlt_record_policy(policy, cfg: RecordConfig) -> None:
     )
 
 
+def _init_logging_keeping_file_handlers() -> None:
+    """LeRobot's `init_logging` clears every root handler, including the session log file the
+    runner attached (`common.configure_logging`); put those back so the session is on disk."""
+    root = logging.getLogger()
+    file_handlers = [handler for handler in root.handlers if isinstance(handler, logging.FileHandler)]
+    init_logging()
+    for handler in file_handlers:
+        root.addHandler(handler)
+
+
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
-    init_logging()
+    _init_logging_keeping_file_handlers()
     if cfg.require_episode_success_label and not cfg.enable_episode_outcome_labeling:
         raise ValueError(
             "`require_episode_success_label=true` requires `enable_episode_outcome_labeling=true`."
@@ -661,6 +670,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     policy_sync_executor = None
     critical_phase_tracker = None
     intervention_tracker = None
+    status_view = None
 
     try:
         if cfg.resume:
@@ -780,33 +790,51 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if cp_key is None and cfg.rlt.enable:
             cp_key = cfg.rlt.critical_phase_toggle_key
 
-        # RLT HIL mode: use SPACE for intervention, r/s/f for phase control
-        rlt_hil_mode = cfg.rlt.enable and policy is not None and teleop is not None
+        # Policy + teleop (HIL): SPACE toggles the intervention. With RLT, r enters the RL phase
+        # and s / f end the episode as success / failure (the loop settles the RL phase and the
+        # intervention).
+        hil_mode = policy is not None and teleop is not None
         rlt_active = cfg.rlt.enable and policy is not None
-        rlt_key_controls_phase = (
-            cfg.rlt.rl_phase_key_toggles_episode or cfg.rlt.rl_phase_key_toggles_critical_phase
-        )
-        if rlt_active and rlt_key_controls_phase:
-            rl_phase_key_binding = cfg.rlt.rl_phase_key
-        elif teleop_r_key_mode:
-            rl_phase_key_binding = "r"
-        else:
-            rl_phase_key_binding = None
-        # In teleop_r_key_mode the r key is the single episode-control input;
-        # unbind s/f so the user cannot accidentally end an episode out of
-        # the double-tap state machine.
-        bind_ep_outcome_keys = cfg.enable_episode_outcome_labeling and not teleop_r_key_mode
+        phase_keys_active = rlt_active or teleop_r_key_mode
         listener, events = init_keyboard_listener(
-            intervention_toggle_key=" " if rlt_hil_mode else cfg.intervention_toggle_key,
+            intervention_toggle_key=" " if hil_mode else cfg.intervention_toggle_key,
             critical_phase_toggle_key=cp_key if not rlt_active else None,
-            episode_success_key=cfg.episode_success_key if bind_ep_outcome_keys else None,
-            episode_failure_key=cfg.episode_failure_key if bind_ep_outcome_keys else None,
+            # Without the RL phase keys, s / f label and end the episode straight from the listener.
+            episode_success_key=cfg.episode_success_key if cfg.enable_episode_outcome_labeling else None,
+            episode_failure_key=cfg.episode_failure_key if cfg.enable_episode_outcome_labeling else None,
             cp_success_key="s" if cfg.enable_critical_phase_labeling and not rlt_active else None,
             cp_failure_key="f" if cfg.enable_critical_phase_labeling and not rlt_active else None,
-            rl_phase_key=rl_phase_key_binding,
-            end_success_key=cfg.rlt.end_success_key if rlt_active else None,
-            end_failure_key=cfg.rlt.end_failure_key if rlt_active else None,
+            rl_phase_key=(cfg.rlt.rl_phase_key if rlt_active else "r") if phase_keys_active else None,
+            end_success_key=cfg.rlt.end_success_key if phase_keys_active else None,
+            end_failure_key=cfg.rlt.end_failure_key if phase_keys_active else None,
         )
+
+        # Counters shown in the status window; the loop reads them, this function updates them.
+        status_session = {
+            "episode_index": dataset.num_episodes,
+            "saved_episodes": dataset.num_episodes,
+            "saved_frames": dataset.num_frames,
+            "successes": 0,
+            "failures": 0,
+            "last_outcome": None,
+            "controls_help": rollout_controls_help(
+                rl_key=(cfg.rlt.rl_phase_key if rlt_active else "r") if phase_keys_active else None,
+                # The runner may have rebound it (`collect --teleop-toggle-key`).
+                intervention_key=(
+                    getattr(init_keyboard_listener, "_evo_rlt_intervention_key", None) or "space"
+                    if hil_mode
+                    else None
+                ),
+            ),
+        }
+        if cfg.status_view:
+            from evo_rlt.adapters.lerobot.record.status_view import StatusView
+
+            # After robot.connect() so the first frames are live, and on the main thread,
+            # the only one OpenCV's GUI can be driven from.
+            status_view = StatusView(
+                None, window_name=f"evo-rlt-record · {cfg.dataset.repo_id}", panel_height=380
+            ).start()
 
         def _warmup_rlt_path() -> None:
             if not (rlt_active and policy is not None and preprocessor is not None and postprocessor is not None):
@@ -869,9 +897,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 skip_prefix_recording=cfg.rlt.skip_prefix_recording or teleop_r_key_mode,
                 rl_phase_key_toggles_episode=cfg.rlt.rl_phase_key_toggles_episode or teleop_r_key_mode,
                 rl_phase_key_toggles_critical_phase=cfg.rlt.rl_phase_key_toggles_critical_phase,
-                rl_phase_double_tap_window_s=cfg.rlt.rl_phase_double_tap_window_s,
                 start_in_teleop=cfg.rlt.start_in_teleop,
                 intervention_action_blend_time_s=cfg.rlt.intervention_action_blend_time_s,
+                status_view=status_view,
+                status_session=status_session,
             )
 
         def _current_episode_frame_count() -> int:
@@ -886,7 +915,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if intervention_tracker is not None:
                 intervention_tracker.on_episode_end(ep_frames)
 
+        def _discard_empty_episode() -> None:
+            # skip_prefix_recording drops every frame before r, so s / f pressed before r (or
+            # while r was still queued behind the leader's teach mode) leaves nothing to save.
+            if events["rerecord_episode"] or _current_episode_frame_count() > 0:
+                return
+            logging.warning(
+                "Episode %s ended with no recorded frames (s/f pressed before r started the "
+                "segment?); discarding it.",
+                dataset.num_episodes,
+            )
+            events["rerecord_episode"] = True
+
         def _resolve_current_episode_success() -> str | None:
+            if events["rerecord_episode"]:
+                return None
             if not cfg.enable_episode_outcome_labeling:
                 return None
             if (
@@ -955,12 +998,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 acp_inference=cfg.acp_inference,
                 communication_retry_timeout_s=cfg.communication_retry_timeout_s,
                 communication_retry_interval_s=cfg.communication_retry_interval_s,
+                status_view=status_view,
+                status_session=status_session,
             )
 
         def _discard_rerecord_episode() -> bool:
             if not events["rerecord_episode"]:
                 return False
             log_say("Re-record episode", cfg.play_sounds)
+            status_session["last_outcome"] = "discarded"
             if critical_phase_tracker is not None:
                 critical_phase_tracker.discard_episode(dataset.num_episodes)
             if intervention_tracker is not None:
@@ -993,6 +1039,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if _discard_rerecord_episode():
                 return recorded_episodes
             dataset.save_episode(extra_episode_metadata=_extra_episode_metadata(episode_success))
+            status_session["saved_episodes"] = status_session["episode_index"] = dataset.num_episodes
+            status_session["saved_frames"] = dataset.num_frames
+            if episode_success == "success":
+                status_session["successes"] += 1
+            elif episode_success == "failure":
+                status_session["failures"] += 1
+            status_session["last_outcome"] = episode_success or "saved (unlabelled)"
             return recorded_episodes + 1
 
         with VideoEncodingManager(dataset):
@@ -1005,6 +1058,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 _reset_policy_for_episode()
                 _record_episode()
                 _finish_episode_trackers()
+                _discard_empty_episode()
                 episode_success = _resolve_current_episode_success()
                 _notify_episode_outcome(episode_success)
                 _run_reset_loop_if_needed(recorded_episodes)
@@ -1067,6 +1121,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 "`dataset.push_to_hub=true` was requested, but dataset was not initialized due to an earlier error."
             )
 
+        # Before the dataset teardown: the window must not stay mapped while encoding blocks.
+        if status_view is not None:
+            status_view.stop()
         log_say("Stop recording", cfg.play_sounds, blocking=True)
         _finalize_dataset()
         _save_critical_phase_intervals()

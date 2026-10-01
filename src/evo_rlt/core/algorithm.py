@@ -36,6 +36,8 @@ class RLTAlgorithm:
             activation=config.critic.activation,
             layer_norm=config.critic.layer_norm,
             residual=config.critic.residual,
+            arch=config.critic.arch,
+            proprio_dim=config.proprio_dim,
         )
 
         self.target_critic = copy.deepcopy(self.critic)

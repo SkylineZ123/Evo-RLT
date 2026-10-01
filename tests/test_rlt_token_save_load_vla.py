@@ -91,3 +91,23 @@ def test_load_ckpt_without_vla_file(monkeypatch, tmp_path: Path) -> None:
     loaded = RLTokenPolicy._load_as_safetensor(fresh, model_file, "cpu", strict=True)
     assert torch.equal(loaded._pi05.weight, sentinel_w)
     assert torch.equal(loaded._pi05.bias, sentinel_b)
+
+
+def test_perceiver_seq_len_derived_from_prefix_settings(monkeypatch) -> None:
+    """Perceiver RL token is sized from the postprocessed prefix and records it in the config."""
+    monkeypatch.setattr(RLTokenPolicy, "_load_pi05_backbone", lambda self: nn.Linear(8, 16))
+    monkeypatch.setattr(RLTokenPolicy, "_compute_num_image_tokens", lambda self, pi05: 12)
+
+    def make(**kwargs) -> RLTokenPolicy:
+        cfg = RLTokenPolicyConfig(
+            device="cpu", rl_token_dim=16, rl_token_nhead=2, rl_token_enc_layers=1, rl_token_dec_layers=1,
+            rl_token_ff_dim=32, rl_token_arch="perceiver", **kwargs,
+        )
+        return RLTokenPolicy(cfg)
+
+    policy = make(active_camera_indices=[0, 2], num_per_camera=4)
+    assert policy.config.rl_token_seq_len == 8
+    assert policy.rl_token.seq_len == 8
+    assert make(image_only=True).rl_token.seq_len == 12
+    assert make(image_only=True, token_pool_size=5).rl_token.seq_len == 5
+    assert make(tokenizer_max_length=20).rl_token.seq_len == 32

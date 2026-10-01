@@ -13,11 +13,11 @@
 seed: 0
 action_dim: 7             # piper: 6 个关节 + 夹爪
 proprio_dim: 7
+vla_horizon: 30           # SFT pi0.5 的 chunk_size（这里只决定加载的专家动作长度，RL token 只读前缀，与它无关）
 
 rl_token:
-  # perceiver = openpi-RLT 结构：RL token 用 cross-attn 读前缀 token；解码器的 query 只是可学习位置，
-  #             重建只能经过 z_rl（不会绕过 z_rl 抄 teacher token）
-  # ar        = 论文 Eq.2 的 teacher-forcing 自回归解码器（旧 checkpoint 用这个；实测解码器几乎不看 z_rl）
+  # perceiver = openpi-RLT 结构：RL token 用 cross-attn 读前缀 token；解码器的 query 只是可学习的位置参数）
+  # ar        = 论文 Eq.2 的 teacher-forcing 自回归解码器
   arch: perceiver
   token_dim: 2048         # 必须等于 pi0.5 PaliGemma 的 hidden size（2048）
   nhead: 8                # 注意力头数，token_dim 需能被整除
@@ -38,12 +38,12 @@ demo_adaptation:
 run:
   # ---- 模型 / 数据 ----
   model_path: /home/boss/zzq/Evo-RLT/output/checkpoint/pi05/blood_gas_teleop_0925/020000/pretrained_model   # SFT 后的 pi0.5
-  demo_dataset_path: /home/boss/lerobot_datasets/piper/0925_blood_gas_insertion_20260925/teleop_154125
+  demo_dataset_path: /home/boss/lerobot_datasets/piper/1001_piper_segment/eval_rlt_segment_144623
   task_instruction: null  # null = 用数据集自带的 task（与 SFT 训练时的 prompt 一致）
   camera_name_map:        # 数据集相机 -> pi0.5 相机槽位，必须与 SFT 的 rename_map 一致
     front: observation.images.base_0_rgb
     wrist: observation.images.right_wrist_0_rgb
-  normalize: true         # 按数据集 q01/q99 把状态归一化到 [-1, 1]（pi0.5 / build_transition_cache 同款）
+  normalize: true         # 按 model_path 里 SFT pi0.5 的 normalizer（q01/q99）把状态归一化，与部署一致；不用数据集自己的 stats
   tokenizer_path: null    # null = google/paligemma-3b-pt-224（本地 HF 缓存）
   vla_cache_dir: null
   dtype: bfloat16
@@ -62,7 +62,9 @@ run:
   eval_every: 1000
 
   # ---- 训练 ----
-  output_dir: /home/boss/zzq/Evo-RLT/output/checkpoint/rl_token/piper_blood_gas_perceiver
+  # piper_blood_gas_perceiver 是旧版（训练帧被拉伸到 224x224，与 SFT/部署的等比缩放+黑边不一致），重训用新目录；
+  # 旧目录的 token_stats.pt 也是拉伸图算的，新代码会拒绝复用它
+  output_dir: /home/boss/zzq/Evo-RLT/output/checkpoint/rl_token/piper_blood_gas_perceiver_r4_1001
   device: cuda
   num_workers: 4
   save_every: 2000

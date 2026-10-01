@@ -118,6 +118,18 @@ def infer_actor_architecture(
     default_ref_dropout_p: float = 0.5,
 ) -> dict[str, int | float | bool | str]:
     """Infer ChunkActor construction kwargs from a saved actor state_dict."""
+    if "net.z_proj.weight" in actor_state_dict:  # core.actor.OpenpiMLP
+        return {
+            "arch": "openpi",
+            "hidden_dim": actor_state_dict["net.hidden.0.weight"].shape[0],
+            "num_layers": len({k.split(".")[2] for k in actor_state_dict if k.startswith("net.hidden.")}),
+            "proprio_dim": actor_state_dict["net.proprio_proj.weight"].shape[1],
+            "activation": default_activation,
+            "layer_norm": False,
+            "residual": False,
+            "fixed_std": default_fixed_std,
+            "ref_dropout_p": default_ref_dropout_p,
+        }
     if "net.input_proj.weight" in actor_state_dict:
         hidden_dim = actor_state_dict["net.input_proj.weight"].shape[0]
         block_indices = {
@@ -130,6 +142,7 @@ def infer_actor_architecture(
             for key in actor_state_dict
         )
         return {
+            "arch": "mlp",
             "hidden_dim": hidden_dim,
             "num_layers": len(block_indices),
             "activation": default_activation,
@@ -153,6 +166,7 @@ def infer_actor_architecture(
         for key, value in actor_state_dict.items()
     )
     return {
+        "arch": "mlp",
         "hidden_dim": hidden_dim,
         "num_layers": num_layers,
         "activation": default_activation,

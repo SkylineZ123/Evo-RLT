@@ -53,6 +53,8 @@ class RLTPolicy(nn.Module):
             activation=config.actor.activation,
             layer_norm=config.actor.layer_norm,
             residual=config.actor.residual,
+            arch=config.actor.arch,
+            proprio_dim=config.proprio_dim,
         )
 
 

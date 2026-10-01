@@ -3,8 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from evo_rlt.core.actor import ResidualMLP
-from evo_rlt.core.utils import build_mlp
+from evo_rlt.core.actor import build_head
 
 
 class ChunkCritic(nn.Module):
@@ -19,18 +18,14 @@ class ChunkCritic(nn.Module):
         activation: str = "relu",
         layer_norm: bool = False,
         residual: bool = False,
+        arch: str = "mlp",
+        proprio_dim: int | None = None,
     ):
         super().__init__()
-        if residual:
-            self.net = ResidualMLP(
-                state_dim + chunk_dim, hidden_dim, 1, num_layers,
-                activation=activation, layer_norm=layer_norm,
-            )
-        else:
-            self.net = build_mlp(
-                state_dim + chunk_dim, hidden_dim, 1, num_layers,
-                activation=activation, layer_norm=layer_norm,
-            )
+        self.net = build_head(
+            arch, state_dim, chunk_dim, 1, hidden_dim, num_layers,
+            activation=activation, layer_norm=layer_norm, residual=residual, proprio_dim=proprio_dim,
+        )
 
     def forward(self, state_vec: torch.Tensor, action_flat: torch.Tensor) -> torch.Tensor:
         """Returns Q-value (B, 1)."""
@@ -49,15 +44,19 @@ class TwinCritic(nn.Module):
         activation: str = "relu",
         layer_norm: bool = False,
         residual: bool = False,
+        arch: str = "mlp",
+        proprio_dim: int | None = None,
     ):
         super().__init__()
         self.q1 = ChunkCritic(
             state_dim, chunk_dim, hidden_dim, num_layers,
             activation=activation, layer_norm=layer_norm, residual=residual,
+            arch=arch, proprio_dim=proprio_dim,
         )
         self.q2 = ChunkCritic(
             state_dim, chunk_dim, hidden_dim, num_layers,
             activation=activation, layer_norm=layer_norm, residual=residual,
+            arch=arch, proprio_dim=proprio_dim,
         )
 
     def forward(

@@ -63,6 +63,8 @@ class ChunkACPolicy(PreTrainedPolicy):
         rl_token_policy = self._load_rl_token_policy()
         object.__setattr__(self, "_rl_token_policy", rl_token_policy)
         self._validate_rl_token_arch(rl_token_policy)
+        if config.compile_model:
+            self._compile_vla()
 
         state_dim = config.rl_token_dim + config.proprio_dim
         chunk_dim = config.chunk_length * config.action_dim
@@ -77,6 +79,8 @@ class ChunkACPolicy(PreTrainedPolicy):
             activation=config.actor_activation,
             layer_norm=config.actor_layer_norm,
             residual=config.actor_residual,
+            arch=config.actor_arch,
+            proprio_dim=config.proprio_dim,
         )
         self.critic = TwinCritic(
             state_dim=state_dim,
@@ -86,6 +90,8 @@ class ChunkACPolicy(PreTrainedPolicy):
             activation=config.critic_activation,
             layer_norm=config.critic_layer_norm,
             residual=config.critic_residual,
+            arch=config.critic_arch,
+            proprio_dim=config.proprio_dim,
         )
         self.target_critic = copy.deepcopy(self.critic)
         for p in self.target_critic.parameters():
@@ -131,6 +137,19 @@ class ChunkACPolicy(PreTrainedPolicy):
         policy.eval()
         return policy
 
+    def _compile_vla(self) -> None:
+        """torch.compile the pi0.5 sampler, the one heavy call per chunk at deploy.
+
+        Eager pi0.5 launches ~14k CUDA kernels per chunk from Python. On the robot the Piper CAN
+        reader threads hold the GIL often enough to stretch a ~0.3 s chunk past 1 s; a CUDA-graph
+        mode replays the kernels as graphs (~0.13 s, barely affected by those threads). The first
+        calls compile and record the graphs, so warm up before the robot moves (evo-rlt-record does).
+        The prefix capture patched into pi0.5 is traced along with the sampler.
+        """
+        model = self._rl_token_policy._pi05.model
+        model.sample_actions = torch.compile(model.sample_actions, mode=self.config.compile_mode)
+        log.info("rlt_ac: pi0.5 sampler compiled (torch.compile mode=%s).", self.config.compile_mode)
+
     def _validate_rl_token_arch(self, rl_token_policy: RLTokenPolicy) -> None:
         rtp_cfg = rl_token_policy.config
         if rtp_cfg.rl_token_dim != self.config.rl_token_dim:
@@ -153,7 +172,8 @@ class ChunkACPolicy(PreTrainedPolicy):
 
         Required keys: state_vec, exec_chunk, ref_chunk, reward_seq,
         next_state_vec, next_ref_chunk, done, actual_steps.
-        Adds flattened views: exec_chunk_flat, ref_chunk_flat, next_ref_flat.
+        Adds flattened views: exec_chunk_flat, ref_chunk_flat, next_ref_flat, and bc_target_flat
+        when the optional bc_target_chunk is given.
         """
         out: dict[str, Tensor] = {}
         for k in (
@@ -175,6 +195,8 @@ class ChunkACPolicy(PreTrainedPolicy):
         out["exec_chunk_flat"] = out["exec_chunk"].flatten(start_dim=-2)
         out["ref_chunk_flat"] = out["ref_chunk"].flatten(start_dim=-2)
         out["next_ref_flat"] = out["next_ref_chunk"].flatten(start_dim=-2)
+        if "bc_target_chunk" in batch:  # optional: BC target differing from the actor's ref input
+            out["bc_target_flat"] = torch.as_tensor(batch["bc_target_chunk"]).flatten(start_dim=-2)
         return out
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
@@ -290,6 +312,11 @@ class ChunkACPolicy(PreTrainedPolicy):
         """
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
+        if self.config.compile_model:
+            raise ValueError(
+                "rlt_ac RTC runs pi0.5 on a background thread, which is not validated with the compiled "
+                "(CUDA-graph) sampler; deploy with RTC off, or without compile_model."
+            )
 
         self._rtc_config = rtc_config
         self._vla_rtc_config = vla_rtc_config or rtc_config
@@ -546,6 +573,10 @@ class ChunkACPolicy(PreTrainedPolicy):
         vla_chunk = pi05.predict_action_chunk(batch, **kwargs)
         vla_chunk = vla_chunk[:, :, : self.config.action_dim]
         prefix_tokens = self._prefix_capture.consume()
+        if self.config.compile_model:
+            # CUDA-graph outputs live in buffers the next replay overwrites; queued VLA-phase
+            # actions must not alias them.
+            vla_chunk, prefix_tokens = vla_chunk.clone(), prefix_tokens.clone()
         proprio = batch["observation.state"][:, : self.config.proprio_dim]
         return mod.compute_chunk(vla_chunk, proprio, prefix_tokens)
 

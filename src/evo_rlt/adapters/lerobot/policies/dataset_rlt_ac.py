@@ -47,7 +47,7 @@ class ChunkTransitionDataset(Dataset):
       done           ()
       intervention   ()
       actual_steps   ()
-      (optional) source, episode_id, is_critical
+      (optional) source, episode_id, is_critical, bc_target_chunk (C, action_dim)
 
     The samples are returned exactly as stored (dicts of tensors); the
     flattening for `exec_chunk_flat` / `ref_chunk_flat` / `next_ref_flat` is
@@ -64,6 +64,11 @@ class ChunkTransitionDataset(Dataset):
         )
         if not self._transitions:
             raise ValueError(f"empty cache at {path}")
+        # A bc_target cache stores bc_target_chunk only on transitions with human steps; give the rest
+        # their ref (what the BC term uses without it) so every sample has the same keys for collation.
+        if any("bc_target_chunk" in t for t in self._transitions):
+            for t in self._transitions:
+                t.setdefault("bc_target_chunk", t["ref_chunk"])
         self.num_frames = len(self._transitions)
         self.num_episodes = 1  # cache is flattened; treat as one mega-episode.
         self.fps = 30

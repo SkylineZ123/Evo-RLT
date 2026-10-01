@@ -260,3 +260,102 @@ def test_release_to_operator_stops_commanding_the_arm(connected_leader):
 def test_new_options_are_validated(field, value):
     with pytest.raises(ValueError):
         PiperLeaderConfig(port="can_left_l", **{field: value})
+
+
+# --------------------------------------------------------------------------- teach button
+
+
+class _TeachButtonArm(_FakeLeaderArm):
+    """Reports ctrl_mode / teach_status the way a Piper leader does around the teach button.
+
+    Measured on the hardware: pressing the button off ends the drag (teach_status 2) but the
+    arm stays in ctrl_mode TEACH (0x02) until the host sends a CAN-control mode frame.
+    """
+
+    def __init__(self, ctrl_mode=0x01, teach_status=0):
+        super().__init__()
+        self.ctrl_mode = ctrl_mode
+        self.teach_status = teach_status
+        self.calls = []
+
+    def get_arm_status(self):
+        msg = SimpleNamespace(ctrl_mode=self.ctrl_mode, teach_status=self.teach_status)
+        return SimpleNamespace(msg=msg, timestamp=time.time())
+
+    def move_j(self, joints):
+        self.calls.append(("move_j", list(joints)))
+
+    def set_motion_mode(self, mode):
+        self.calls.append(("set_motion_mode", mode))
+        if self.ctrl_mode == 0x02 and self.teach_status == 0x02:
+            # The mode frame is what takes a released arm out of TEACH.
+            self.ctrl_mode, self.teach_status = 0x01, 0x00
+
+
+@pytest.fixture
+def teach_leader(leader_factory):
+    def _leader(ctrl_mode, teach_status) -> PiperLeader:
+        leader = leader_factory(teach_mode_poll_interval_s=0.0, teach_mode_debounce_s=0.0)
+        leader.arm = leader.gripper = _TeachButtonArm(ctrl_mode, teach_status)
+        leader._is_connected = True
+        leader._manual_control_enabled = True
+        return leader
+
+    return _leader
+
+
+@pytest.mark.parametrize(
+    ("ctrl_mode", "teach_status", "engaged"),
+    [
+        (0x01, 0x00, False),  # CAN control
+        (0x00, 0x00, False),  # standby
+        (0x02, 0x01, True),  # dragging
+        (0x02, 0x02, False),  # drag ended, still in ctrl_mode TEACH
+        (0x02, 0x00, True),  # unknown teach state: keep the operator in charge
+        (0x06, 0x00, True),  # linkage teach input (leader role)
+    ],
+)
+def test_teach_engaged_follows_the_drag_not_the_ctrl_mode(ctrl_mode, teach_status, engaged):
+    from evo_rlt.adapters.lerobot.hardware.piper.agx_arm import piper_teach_engaged
+
+    assert piper_teach_engaged(ctrl_mode, teach_status) is engaged
+
+
+def test_releasing_the_teach_button_is_reported_although_ctrl_mode_stays_teach(teach_leader):
+    leader = teach_leader(0x02, 0x01)
+    # A first reading only arms the debounce; the second one reports it.
+    leader.is_teach_mode_active()
+    assert leader.is_teach_mode_active() is True
+
+    leader.arm.teach_status = 0x02
+    leader.is_teach_mode_active()
+    assert leader.is_teach_mode_active() is False
+
+
+def test_handing_back_after_the_drag_seeds_the_pose_then_requests_can_control(teach_leader):
+    leader = teach_leader(0x02, 0x02)
+
+    leader.set_manual_control(False)
+
+    assert leader._manual_control_enabled is False
+    assert leader.arm.calls[0] == ("move_j", leader.arm.pose)
+    assert leader.arm.calls[1] == ("set_motion_mode", "js")
+    assert leader.arm.ctrl_mode == 0x01
+
+
+def test_no_can_request_while_the_operator_is_still_dragging(teach_leader):
+    leader = teach_leader(0x02, 0x01)
+    leader.is_teach_mode_active()  # debounce: report the drag
+
+    leader.set_manual_control(False)
+
+    assert leader.arm.calls == []
+    assert leader._manual_control_enabled is True
+
+
+def test_no_seed_when_the_arm_is_already_under_can_control(teach_leader):
+    leader = teach_leader(0x01, 0x00)
+
+    leader.set_manual_control(False)
+
+    assert leader.arm.calls == [("set_motion_mode", "js")]

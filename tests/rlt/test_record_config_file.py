@@ -115,7 +115,7 @@ def patched_listener(monkeypatch):
     """Install the record keyboard patch over a stand-in for LeRobot 0.5.1's listener."""
     control_utils = pytest.importorskip("lerobot.utils.control_utils")
     from evo_rlt.adapters.lerobot.record import pedal_listener
-    from evo_rlt.adapters.lerobot.record.runner import _patch_double_tap_episode_outcome_listener
+    from evo_rlt.adapters.lerobot.record.runner import _patch_record_key_listener
 
     captured = {}
 
@@ -135,26 +135,27 @@ def patched_listener(monkeypatch):
     monkeypatch.setattr(control_utils, "is_headless", lambda: True)
     monkeypatch.setattr(control_utils, "init_keyboard_listener", lerobot_051_init_keyboard_listener)
     monkeypatch.setattr(pedal_listener, "PedalListener", FakePedalListener)
-    _patch_double_tap_episode_outcome_listener(0.0, None)
+    _patch_record_key_listener()
     return control_utils.init_keyboard_listener, captured
 
 
-def test_listener_without_outcome_key_accepts_record_kwargs_and_labels_with_s_f(patched_listener):
+def test_listener_accepts_record_kwargs_and_labels_with_s_f(patched_listener):
     init_keyboard_listener, captured = patched_listener
-    # `full` without a pedal: RLT is off, so s/f are free to label the episode.
+    # `full`: RLT is off, so s/f label and end the episode straight from the listener.
     listener, events = init_keyboard_listener(
-        intervention_toggle_key="i", episode_success_key="s", episode_failure_key="f"
+        intervention_toggle_key=" ", episode_success_key="s", episode_failure_key="f"
     )
-    captured["on_press"]("i")
+    captured["on_press"]("space")
     assert events["toggle_intervention"] is True
     captured["on_press"]("f")
     assert (events["episode_outcome"], events["exit_early"]) == ("failure", True)
     listener.stop()
 
 
-def test_listener_without_outcome_key_leaves_s_f_to_rlt_phase_keys(patched_listener):
+def test_listener_routes_s_f_to_the_loop_when_rl_phase_keys_are_bound(patched_listener):
     init_keyboard_listener, captured = patched_listener
-    # `collect --only-critical` / `segment`: s/f already end the RL phase.
+    # `collect` / `segment`: the recording loop ends the episode on s/f, so it can also settle
+    # the RL phase and the intervention first.
     listener, events = init_keyboard_listener(
         intervention_toggle_key=" ",
         episode_success_key="s",

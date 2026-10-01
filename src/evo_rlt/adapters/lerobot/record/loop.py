@@ -59,9 +59,20 @@ from evo_rlt.adapters.lerobot.record.annotations import (
     PHASE_CRITICAL,
     PHASE_PREFIX,
     SOURCE_HUMAN,
+    SOURCE_RL,
     SOURCE_VLA,
     resolve_collector_policy_id,
     resolve_rlt_collector_policy_id,
+)
+from evo_rlt.adapters.lerobot.record.rollout_status import (
+    CONTROL_HUMAN,
+    CONTROL_RESET,
+    CONTROL_RLT,
+    CONTROL_VLA,
+    HANDOVER_RELEASE,
+    HANDOVER_RL_START,
+    RolloutStatus,
+    build_rollout_status,
 )
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.device_utils import get_safe_torch_device
@@ -233,10 +244,30 @@ def record_loop(
     skip_prefix_recording: bool = False,
     rl_phase_key_toggles_episode: bool = False,
     rl_phase_key_toggles_critical_phase: bool = False,
-    rl_phase_double_tap_window_s: float = 1.0,
     start_in_teleop: bool = False,
     intervention_action_blend_time_s: float = 0.0,
+    teach_release_grace_s: float = 0.5,
+    status_view: Any | None = None,
+    status_session: dict[str, Any] | None = None,
 ):
+    """Drive the robot from the policy and/or teleop at *fps*, writing frames to *dataset*.
+
+    Operator keys arrive as flags in *events*:
+
+    * ``start_rl_phase`` (r): enter the RL phase. With ``rl_phase_key_toggles_critical_phase``
+      a second press returns to VLA; with ``rl_phase_key_toggles_episode`` it is ignored.
+    * ``end_phase_success`` / ``end_phase_failure`` (s / f): end the episode with that outcome.
+    * ``toggle_intervention`` (space): take over from the policy, or hand control back.
+
+    A request to hand control back to the policy (space, or r during an intervention) while a
+    Piper leader is still in teach mode is queued, and runs *teach_release_grace_s* after the
+    teach button is released. Pressing the same key again while still in teach mode cancels it.
+
+    *status_view* is drawn every tick; *status_session* carries the session counters the
+    caller keeps (saved episodes/frames, success/failure counts, last outcome).
+    """
+    if teach_release_grace_s < 0:
+        raise ValueError("teach_release_grace_s must be >= 0")
     if intervention_action_blend_time_s < 0:
         raise ValueError("intervention_action_blend_time_s must be >= 0")
     if acp_inference is None:
@@ -328,17 +359,6 @@ def record_loop(
         cond_policy_runtime_state = _capture_policy_runtime_state(policy)
         uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
 
-    def teach_mode_blocks_release() -> bool:
-        """Keep the human in control while a Piper leader's teach button is still engaged."""
-        if not leader_teach_mode_active(teleop_arm_for_mode_switch):
-            return False
-        logging.warning(
-            "Leader is still in teach mode: press the teach button on the leader arm to exit "
-            "teach mode first, then press the toggle key again. Staying in intervention (S1)."
-        )
-        log_say("exit teach mode first", play_sounds=True)
-        return True
-
     if intervention_enabled and intervention_state == INTERVENTION_STATE_POLICY and leader_teach_mode_active(
         teleop_arm_for_mode_switch
     ):
@@ -415,19 +435,25 @@ def record_loop(
     start_episode_t = time.perf_counter()
     prev_phase = PHASE_PREFIX
     rl_phase_started = False
-    pending_end_press_time: float | None = None
     final_outcome: str | None = None
+    # A handover the operator asked for while the leader was still in teach mode.
+    pending_handover: str | None = None
+    teach_released_t: float | None = None
+    measured_fps: float | None = None
     _frame_idx = 0
     _cuda_cleanup_interval = 500  # defrag CUDA allocator every N frames
 
     def get_episode_frame_index() -> int:
-        if dataset is None or dataset.episode_buffer is None:
+        if dataset is None:
             return 0
-        return dataset.episode_buffer["size"]
+        # LeRobot 0.5.1 keeps the buffer on the dataset's writer, not on the dataset.
+        buffer = getattr(dataset, "episode_buffer", None)
+        if buffer is None:
+            buffer = getattr(getattr(dataset, "writer", None), "episode_buffer", None)
+        return buffer["size"] if buffer else 0
 
     def _start_intervention() -> None:
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        nonlocal pending_end_press_time
         intervention_state = INTERVENTION_STATE_ACTIVE
         set_teleop_manual_control(True)
         if rlt_intervention_tracker is not None:
@@ -442,12 +468,11 @@ def record_loop(
         if rlt is not None:
             rlt.interrupt_chunk()
             log_say("intervene", play_sounds=True)
-        pending_end_press_time = None
         logging.info("Intervention enabled (S1): teleop actions now override policy execution.")
         if callable(getattr(teleop_arm_for_mode_switch, "is_teach_mode_active", None)):
             logging.info(
                 "Leader holds its pose: press the teach button on the leader arm to drag it. "
-                "Press it again, then the toggle key, to hand control back to the policy."
+                "Space or r while it is still in teach mode is queued until the button is released."
             )
 
     def _reset_policy_after_intervention_release() -> None:
@@ -462,7 +487,8 @@ def record_loop(
             uncond_policy_runtime_state = _capture_policy_runtime_state(policy)
         logging.info("Policy cache reset on release: next policy action is recomputed.")
 
-    def _release_intervention() -> None:
+    def _hand_back_to_policy() -> None:
+        """S1 -> S2: end the operator's intervention and let the policy drive again."""
         nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
         if rlt_intervention_tracker is not None:
             rlt_intervention_tracker.stop(get_episode_frame_index())
@@ -471,14 +497,92 @@ def record_loop(
         intervention_blend_start_action = None
         set_teleop_manual_control(False)
         _reset_policy_after_intervention_release()
+        logging.info("Intervention released (S2): returning control to the policy.")
+
+    def _release_intervention() -> None:
+        _hand_back_to_policy()
         if rlt is not None:
             if rl_phase_started:
                 rlt.set_rl_mode()
             else:
                 rlt.interrupt_chunk()
             log_say("resume", play_sounds=True)
-            logging.info("RLT chunk interrupted on release: next action recomputed.")
-        logging.info("Intervention release requested (S2): returning control to policy.")
+
+    def _start_rl_phase() -> None:
+        nonlocal rl_phase_started
+        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+            _hand_back_to_policy()
+        if rlt is not None:
+            rlt.set_rl_mode()
+        if critical_phase_tracker is not None and dataset is not None:
+            critical_phase_tracker.toggle(get_episode_frame_index())
+        rl_phase_started = True
+        log_say("RL start", play_sounds=True)
+        logging.info("RL phase started (r key)")
+
+    def _end_rl_phase() -> None:
+        """Back to VLA inside the same episode; the outcome is set later with s/f."""
+        nonlocal rl_phase_started
+        if rlt is not None:
+            rlt.set_vla_mode()
+        if critical_phase_tracker is not None and dataset is not None and critical_phase_tracker.is_active:
+            critical_phase_tracker.toggle(get_episode_frame_index())
+        rl_phase_started = False
+        log_say("VLA", play_sounds=True)
+        logging.info("RL phase ended (r key): back to VLA. Press s or f to end the episode.")
+
+    def _run_handover(request: str) -> None:
+        if request == HANDOVER_RL_START:
+            _start_rl_phase()
+        else:
+            _release_intervention()
+
+    def _request_handover(request: str, key: str) -> None:
+        """Hand control to the policy now, or queue it while the leader is in teach mode.
+
+        A Piper leader in teach mode rejects CAN commands, so the policy could not keep it in
+        sync with the follower; it would snap onto the follower once the button is released.
+        """
+        nonlocal pending_handover, teach_released_t
+        if not leader_teach_mode_active(teleop_arm_for_mode_switch):
+            pending_handover = None
+            _run_handover(request)
+            return
+        if pending_handover == request:
+            pending_handover = None
+            logging.info("Queued '%s' cancelled; the operator keeps control.", request)
+            log_say("cancelled", play_sounds=True)
+            return
+        pending_handover = request
+        teach_released_t = None
+        logging.warning(
+            "Leader is in teach mode: '%s' is queued and runs %.1fs after the teach button is released "
+            "(press %s again to cancel). Staying in intervention (S1).",
+            request,
+            teach_release_grace_s,
+            key,
+        )
+        log_say("exit teach mode first", play_sounds=True)
+
+    def _resolve_pending_handover() -> None:
+        nonlocal pending_handover, teach_released_t
+        if pending_handover is None:
+            return
+        if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
+            pending_handover = None
+            return
+        if leader_teach_mode_active(teleop_arm_for_mode_switch):
+            teach_released_t = None
+            return
+        now = time.perf_counter()
+        if teach_released_t is None:
+            # Give the operator's hand time to leave the arm before the policy moves it.
+            teach_released_t = now
+            logging.info("Teach mode released: '%s' in %.1fs.", pending_handover, teach_release_grace_s)
+        if now - teach_released_t < teach_release_grace_s:
+            return
+        request, pending_handover, teach_released_t = pending_handover, None, None
+        _run_handover(request)
 
     def _handle_intervention_toggle() -> None:
         if not events.get("toggle_intervention", False):
@@ -490,9 +594,7 @@ def record_loop(
         if intervention_state == INTERVENTION_STATE_POLICY:
             _start_intervention()
             return
-        if teach_mode_blocks_release():
-            return
-        _release_intervention()
+        _request_handover(HANDOVER_RELEASE, "space")
 
     def _handle_critical_phase_events() -> None:
         if events.get("toggle_critical_phase", False):
@@ -500,126 +602,54 @@ def record_loop(
             if rlt is not None:
                 rlt.trigger_critical_phase()
             if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.toggle(dataset.episode_buffer["size"])
+                critical_phase_tracker.toggle(get_episode_frame_index())
                 if critical_phase_tracker.is_active:
                     from lerobot.utils.audio_feedback import say_start
                     say_start()
         if events.get("cp_mark_success", False):
             events["cp_mark_success"] = False
             if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
+                critical_phase_tracker.mark_success(get_episode_frame_index())
                 from lerobot.utils.audio_feedback import say_success
                 say_success()
         if events.get("cp_mark_failure", False):
             events["cp_mark_failure"] = False
             if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
+                critical_phase_tracker.mark_failure(get_episode_frame_index())
                 from lerobot.utils.audio_feedback import say_failure
                 say_failure()
 
-    def _finish_active_rl_phase(toggles_episode: bool, toggles_cp: bool) -> None:
-        nonlocal final_outcome, pending_end_press_time, rl_phase_started
-        if pending_end_press_time is None:
-            pending_end_press_time = time.perf_counter()
-            log_say("RL end", play_sounds=True)
-            logging.info("RL end pending - tap r again within %.1fs to mark failure", rl_phase_double_tap_window_s)
-            return
-        if toggles_episode:
-            final_outcome = EPISODE_FAILURE
-            events["exit_early"] = True
-        elif toggles_cp:
-            if rlt is not None:
-                rlt.set_vla_mode()
-            if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.mark_failure(dataset.episode_buffer["size"])
-            rl_phase_started = False
-        pending_end_press_time = None
-        log_say("failure", play_sounds=True)
-        logging.info("RL phase ended via double-tap (failure)")
-
-    def _start_rl_phase_from_key() -> None:
-        nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        nonlocal rl_phase_started, pending_end_press_time
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
-            if teach_mode_blocks_release():
-                return
-            intervention_state = INTERVENTION_STATE_RELEASE
-            intervention_blend_start_t = None
-            intervention_blend_start_action = None
-            set_teleop_manual_control(False)
-        if rlt is not None:
-            rlt.set_rl_mode()
-        if critical_phase_tracker is not None and dataset is not None:
-            critical_phase_tracker.toggle(dataset.episode_buffer["size"])
-        rl_phase_started = True
-        pending_end_press_time = None
-        log_say("RL start", play_sounds=True)
-        logging.info("RL phase started (r key)")
-
-    def _handle_rl_phase_start_event() -> None:
+    def _handle_rl_phase_key() -> None:
         if not events.get("start_rl_phase", False):
             return
         events["start_rl_phase"] = False
-        r_key_active = rlt is not None or rl_phase_key_toggles_episode or rl_phase_key_toggles_critical_phase
-        active_intervention = intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE
-        if rl_phase_started and active_intervention:
-            logging.info("Ignoring r key: human intervention is active")
+        if rlt is None and not (rl_phase_key_toggles_episode or rl_phase_key_toggles_critical_phase):
             return
-        if not r_key_active:
+        if not rl_phase_started:
+            if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
+                _request_handover(HANDOVER_RL_START, "r")
+            else:
+                _start_rl_phase()
             return
-        toggles_episode = rl_phase_key_toggles_episode
-        toggles_cp = rl_phase_key_toggles_critical_phase
-        if (toggles_episode or toggles_cp) and rl_phase_started:
-            _finish_active_rl_phase(toggles_episode, toggles_cp)
+        if rl_phase_key_toggles_critical_phase:
+            _end_rl_phase()
             return
-        _start_rl_phase_from_key()
+        logging.info("Already in the RL phase: press s (success) or f (failure) to end the episode.")
+        log_say("press s or f", play_sounds=True)
 
-    def _resolve_pending_rl_phase_end() -> None:
-        nonlocal final_outcome, pending_end_press_time, rl_phase_started
-        if pending_end_press_time is None or final_outcome is not None:
-            return
-        if (time.perf_counter() - pending_end_press_time) < rl_phase_double_tap_window_s:
-            return
-        if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
-            return
-        if rl_phase_key_toggles_episode:
-            final_outcome = EPISODE_SUCCESS
-            events["exit_early"] = True
-        elif rl_phase_key_toggles_critical_phase and rlt is not None:
-            rlt.set_vla_mode()
-            if critical_phase_tracker is not None and dataset is not None:
-                critical_phase_tracker.mark_success(dataset.episode_buffer["size"])
-            rl_phase_started = False
-        pending_end_press_time = None
-        log_say("success", play_sounds=True)
-        logging.info("RL phase ended via single press (success)")
-
-    def _release_active_intervention_after_phase_end() -> None:
-        nonlocal intervention_state, intervention_blend_start_t, intervention_blend_start_action
-        if not (intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE):
-            return
-        if teach_mode_blocks_release():
-            return
-        if rlt_intervention_tracker is not None:
-            rlt_intervention_tracker.stop(get_episode_frame_index())
-        intervention_state = INTERVENTION_STATE_RELEASE
-        intervention_blend_start_t = None
-        intervention_blend_start_action = None
-        set_teleop_manual_control(False)
-
-    def _handle_end_phase_event(event_name: str, outcome: str) -> None:
+    def _handle_outcome_key(event_name: str, outcome: str) -> None:
+        """s / f: end the episode with *outcome*; the tail of record_loop settles the rest."""
+        nonlocal final_outcome, pending_handover
         if not events.get(event_name, False):
             return
         events[event_name] = False
-        if rlt is None:
+        if final_outcome is not None:
             return
-        rlt.set_vla_mode()
-        if critical_phase_tracker is not None and dataset is not None:
-            marker = critical_phase_tracker.mark_success if outcome == EPISODE_SUCCESS else critical_phase_tracker.mark_failure
-            marker(dataset.episode_buffer["size"])
-        _release_active_intervention_after_phase_end()
+        final_outcome = outcome
+        pending_handover = None
+        events["exit_early"] = True
         log_say(outcome, play_sounds=True)
-        logging.info("RL phase ended (%s)", outcome)
+        logging.info("Episode ended by the operator: %s", outcome)
 
     def _select_action_values(
         act_processed_policy: RobotAction | None,
@@ -692,6 +722,52 @@ def record_loop(
             human_id=collector_policy_id_human,
         )
 
+    session_status = status_session if status_session is not None else {}
+    has_teach_button = callable(getattr(teleop_arm_for_mode_switch, "is_teach_mode_active", None))
+    prev_status_t: float | None = None
+
+    def _control_label(is_intervention: float, rlt_source: float) -> str:
+        if policy is None:
+            return CONTROL_HUMAN if dataset is not None else CONTROL_RESET
+        if is_intervention:
+            return CONTROL_HUMAN
+        return CONTROL_RLT if rlt_source == SOURCE_RL else CONTROL_VLA
+
+    def _publish_status(
+        obs_processed: RobotObservation, is_intervention: float, rlt_source: float, rlt_phase: float, wrote_frame: bool
+    ) -> None:
+        nonlocal measured_fps, prev_status_t
+        now = time.perf_counter()
+        if prev_status_t is not None and now > prev_status_t:
+            rate = 1.0 / (now - prev_status_t)
+            measured_fps = rate if measured_fps is None else 0.9 * measured_fps + 0.1 * rate
+        prev_status_t = now
+        status = RolloutStatus(
+            task=single_task or "",
+            control=_control_label(is_intervention, rlt_source),
+            critical=rlt_phase == PHASE_CRITICAL,
+            recording=wrote_frame,
+            step=get_episode_frame_index(),
+            elapsed_s=now - start_episode_t,
+            fps=measured_fps,
+            episode_index=session_status.get("episode_index"),
+            teach_mode=leader_teach_mode_active(teleop_arm_for_mode_switch) if has_teach_button else None,
+            queued=pending_handover,
+            queued_key="r" if pending_handover == HANDOVER_RL_START else "space",
+            waiting_for_rl=dataset is not None and skip_prefix_recording and not rl_phase_started,
+            saved_episodes=session_status.get("saved_episodes"),
+            saved_frames=session_status.get("saved_frames"),
+            successes=session_status.get("successes", 0),
+            failures=session_status.get("failures", 0),
+            last_outcome=session_status.get("last_outcome"),
+        )
+        if "controls_help" in session_status:
+            status.controls_help = session_status["controls_help"]
+        status_view.update(obs_processed, build_rollout_status(status))
+        # Keys reach the recorder through the global keyboard hook; forwarding the window's
+        # own key events as well would fire every press twice.
+        status_view.render_once(lambda _key: None)
+
     # Per-frame timing instrumentation -> /tmp/frame_timing.csv
     _perf_fh = open("/tmp/frame_timing.csv", "w")  # noqa: SIM115
     _perf_fh.write("frame,total_ms,obs_ms,infer_ms,send_ms,dataset_ms,sleep_ms\n")
@@ -708,10 +784,10 @@ def record_loop(
 
         _handle_intervention_toggle()
         _handle_critical_phase_events()
-        _handle_rl_phase_start_event()
-        _resolve_pending_rl_phase_end()
-        _handle_end_phase_event("end_phase_success", EPISODE_SUCCESS)
-        _handle_end_phase_event("end_phase_failure", EPISODE_FAILURE)
+        _handle_rl_phase_key()
+        _handle_outcome_key("end_phase_success", EPISODE_SUCCESS)
+        _handle_outcome_key("end_phase_failure", EPISODE_FAILURE)
+        _resolve_pending_handover()
 
         # Get robot observation
         _t0 = time.perf_counter()
@@ -827,6 +903,7 @@ def record_loop(
         rlt_is_critical = float(rlt_phase == PHASE_CRITICAL)
 
         # Write to dataset
+        wrote_frame = False
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             policy_action_frame = build_dataset_frame(
@@ -849,6 +926,7 @@ def record_loop(
                 _t0 = time.perf_counter()
                 dataset.add_frame(frame)
                 _t_dataset = (time.perf_counter() - _t0) * 1000
+                wrote_frame = True
 
                 _write_recovery_row(frame)
 
@@ -866,6 +944,9 @@ def record_loop(
             log_rerun_data(
                 observation=obs_processed, action=action_values, compress_images=display_compressed_images
             )
+
+        if status_view is not None:
+            _publish_status(obs_processed, is_intervention, rlt_source, rlt_phase, wrote_frame)
 
         if intervention_state == INTERVENTION_STATE_RELEASE:
             intervention_state = INTERVENTION_STATE_POLICY
@@ -891,9 +972,8 @@ def record_loop(
 
         timestamp = time.perf_counter() - start_episode_t
 
-    # Finalize toggle-mode episode end: stop intervention, switch RLT back to
-    # VLA mode, and tag both the critical phase interval and the episode with
-    # the resolved success/failure outcome.
+    # s / f ended the episode: stop the intervention, switch RLT back to VLA mode, and
+    # tag both the critical phase interval and the episode with the outcome.
     if final_outcome is not None:
         if intervention_enabled and intervention_state == INTERVENTION_STATE_ACTIVE:
             if rlt_intervention_tracker is not None:
@@ -903,7 +983,7 @@ def record_loop(
         if rlt is not None:
             rlt.set_vla_mode()
         if critical_phase_tracker is not None and dataset is not None:
-            ep_size = dataset.episode_buffer["size"]
+            ep_size = get_episode_frame_index()
             if final_outcome == EPISODE_SUCCESS:
                 critical_phase_tracker.mark_success(ep_size)
             else:

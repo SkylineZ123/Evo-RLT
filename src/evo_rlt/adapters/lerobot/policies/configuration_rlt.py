@@ -51,6 +51,7 @@ class RLTPretrainedConfig(PreTrainedConfig):
     rl_token_seq_len: int | None = None
 
     # --- Actor architecture ---
+    actor_arch: str = "mlp"  # "mlp" | "openpi", see evo_rlt.core.actor.build_head
     actor_hidden_dim: int = 256
     actor_num_layers: int = 3
     actor_fixed_std: float = 0.05

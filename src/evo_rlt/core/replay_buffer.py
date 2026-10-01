@@ -7,6 +7,7 @@ import torch
 
 from evo_rlt.core.interfaces import (
     ACTUAL_STEPS,
+    BC_TARGET_FLAT,
     DONE,
     EPISODE_ID,
     EXEC_CHUNK_FLAT,
@@ -57,6 +58,9 @@ class ReplayBuffer:
             STATE_VEC: torch.stack([t.state_vec for t in batch]),
             EXEC_CHUNK_FLAT: stacked_exec.flatten(start_dim=-2),
             REF_CHUNK_FLAT: stacked_ref.flatten(start_dim=-2),
+            BC_TARGET_FLAT: torch.stack([
+                t.ref_chunk if t.bc_target_chunk is None else t.bc_target_chunk for t in batch
+            ]).flatten(start_dim=-2),
             REWARD_SEQ: torch.stack([t.reward_seq for t in batch]),
             NEXT_STATE_VEC: torch.stack([t.next_state_vec for t in batch]),
             NEXT_REF_FLAT: stacked_next_ref.flatten(start_dim=-2),

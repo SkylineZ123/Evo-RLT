@@ -49,9 +49,10 @@ def critic_loss(
     actual_steps = batch.get("actual_steps")
 
     with torch.no_grad():
-        # Use deterministic mean for target action (TD3-style), clamped to [-1,1]
+        # Use deterministic mean for target action (TD3-style), clamped to the actor's per-dim
+        # action bounds (the range of executed actions), not a fixed [-1, 1]
         mu_next, _ = actor.forward(x_next, ref_next)
-        mu_next = mu_next.clamp(-1.0, 1.0)
+        mu_next = actor.clamp_action(mu_next)
         q_next = target_critic.min_q(x_next, mu_next)
         if target_q_clip is not None and target_q_clip > 0:
             q_next = q_next.clamp(-target_q_clip, target_q_clip)
@@ -75,16 +76,19 @@ def actor_loss(
     batch: dict[str, torch.Tensor],
     beta: float,
 ) -> torch.Tensor:
-    """Q-maximization + BC regularization toward VLA reference.
+    """Q-maximization + BC regularization toward the BC target (the VLA reference by default).
 
     Uses deterministic mean (not noisy samples) for stable optimization.
+    The actor is conditioned on ref_chunk_flat; the BC term pulls toward bc_target_flat when the batch
+    has it (human action on intervened steps), else toward the ref itself.
     BC term is the per-sample squared distance summed across action dims, then
     averaged over the batch — matching the paper's β-scaling convention. This
     differs from mean-MSE by a factor of C*D_flat.
     """
     x = batch["state_vec"]
     ref = batch["ref_chunk_flat"]
+    target = batch.get("bc_target_flat", ref)
     mu, _ = actor.forward(x, ref, training=True)
     q = critic.min_q(x, mu)
-    bc_reg = ((mu - ref) ** 2).sum(dim=-1).mean()
+    bc_reg = ((mu - target) ** 2).sum(dim=-1).mean()
     return -q.mean() + beta * bc_reg

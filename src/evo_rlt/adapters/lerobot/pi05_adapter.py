@@ -32,6 +32,29 @@ DEFAULT_CAMERA_NAME_MAP = {
 }
 
 
+def checkpoint_chunk_size(model_path: str, cache_dir: str | None = None) -> int:
+    """The action chunk length a pi0.5 checkpoint was trained with (its saved config's chunk_size).
+
+    Deploy samples chunks of this length (the policy loads the SFT config), so the reference
+    chunks cached for the actor must be sampled with it too.
+    """
+    from lerobot.configs.policies import PreTrainedConfig
+
+    return PreTrainedConfig.from_pretrained(model_path, cache_dir=cache_dir).chunk_size
+
+
+def build_pi05_prompts(state: torch.Tensor, task: str) -> list[str]:
+    """Build pi0.5 prompts exactly as the SFT/deploy preprocessor does.
+
+    Mirrors lerobot's Pi05PrepareStateTokenizerProcessorStep: the normalized state is
+    discretized at its own width (no padding to max_state_dim) and without clipping, so
+    values below -1 give bin -1 and values at or above the top bin edge give 255.
+    """
+    state_np = state.detach().float().cpu().numpy()
+    discretized = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+    return [f"Task: {task}, State: {' '.join(map(str, row))};\nAction: " for row in discretized]
+
+
 def _tie_embed_tokens(pi05_policy: PI05Policy) -> None:
     """Restore tied language embeddings when SFT checkpoints omit embed_tokens."""
     lm = pi05_policy.model.paligemma_with_expert.paligemma
@@ -73,11 +96,12 @@ class Pi05VLAAdapter(VLAAdapter):
         if unknown_slots:
             raise ValueError(f"camera_name_map targets {unknown_slots} are not pi0.5 camera slots {self.camera_order}")
 
+        chunk_size = checkpoint_chunk_size(model_path, cache_dir)
         pi05_config = PI05Config(
             device=device,
             dtype=dtype,
-            chunk_size=50,
-            n_action_steps=50,
+            chunk_size=chunk_size,
+            n_action_steps=chunk_size,
             max_action_dim=32,
             max_state_dim=32,
             image_resolution=(224, 224),
@@ -205,19 +229,7 @@ class Pi05VLAAdapter(VLAAdapter):
 
     def _prepare_language_tokens(self, obs: Observation) -> tuple[torch.Tensor, torch.Tensor]:
         device = self.model_device
-        proprio = obs.proprio[..., : self.actual_proprio_dim].to(device=device, dtype=torch.float32)
-        proprio = pad_vector(proprio, self.pi05_config.max_state_dim)
-
-        state_np = proprio.detach().cpu().numpy()
-        state_np = np.clip(state_np, -1.0, 1.0)
-        bins = np.linspace(-1, 1, 256 + 1)[:-1]
-        discretized = np.digitize(state_np, bins=bins) - 1
-        discretized = np.clip(discretized, 0, 255)
-
-        prompts = []
-        for state_tokens in discretized:
-            state_str = " ".join(map(str, state_tokens))
-            prompts.append(f"Task: {self.task_instruction}, State: {state_str};\nAction: ")
+        prompts = build_pi05_prompts(obs.proprio[..., : self.actual_proprio_dim], self.task_instruction)
 
         encoded = self.tokenizer(
             prompts,
@@ -306,7 +318,8 @@ class Pi05VLAAdapter(VLAAdapter):
         images, img_masks = self._prepare_images(obs)
         tokens, masks = self._prepare_language_tokens(obs)
 
-        actions = expert_actions[..., : self.actual_action_dim].to(device=self.model_device, dtype=torch.float32)
+        actions = expert_actions[:, : self.pi05_config.chunk_size, : self.actual_action_dim]
+        actions = actions.to(device=self.model_device, dtype=torch.float32)
         actions = pad_vector(actions, self.pi05_config.max_action_dim)
 
         losses = self.pi05.forward(images, img_masks, tokens, masks, actions)

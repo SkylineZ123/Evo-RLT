@@ -96,7 +96,11 @@ def build_encoder(args: argparse.Namespace, config):
 def main() -> None:
     args = parse_args()
 
-    from evo_rlt.adapters.lerobot.demo_loader import RLTDemoDataset, rlt_demo_collate
+    from evo_rlt.adapters.lerobot.demo_loader import (
+        RLTDemoDataset,
+        load_policy_normalization_stats,
+        rlt_demo_collate,
+    )
     from evo_rlt.adapters.lerobot.offline_dataset import (
         build_overlap_frame_indices,
         build_transitions_from_demos,
@@ -120,6 +124,7 @@ def main() -> None:
         dataset_path=args.demo_dataset_path,
         chunk_length=config.vla_horizon,
         normalize_actions=True,
+        normalization_stats=load_policy_normalization_stats(args.model_path),
     )
     num_episodes = _count_episodes(dataset)
     splits = split_episode_indices(
